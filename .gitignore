@@ -30,6 +30,25 @@ pdp_solver_*
 
 # CMake build directory
 build/
+build-*/
+CMakeFiles/
+
+# Local third-party distributions and runtime libraries
+third_party/
+*.dll
+
+# Solver-generated artifacts and experiment outputs
+results/
+*.lp
+*.sol
+*.mst
+cplex.log
+clone*.log
+
+# LaTeX intermediates
+*.aux
+*.log
+*.out
 
 # Python cache
 __pycache__/

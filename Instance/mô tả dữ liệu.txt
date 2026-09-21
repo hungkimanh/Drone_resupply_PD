@@ -1,0 +1,42 @@
+# ==========================================
+# INSTANCE CONFIGURATION: Static Drone Resupply System
+# Reference: Archetti et al. (2018, 2020), Pina-Pardo et al. (2024)
+# ==========================================
+
+# ------------------------
+# Depot configuration
+# ------------------------
+Depot_positions:
+  - Border: (0, 10)
+
+# ------------------------
+# Truck parameters
+# ------------------------
+Truck:
+  Distance_metric: Manhattan
+  M_T: 50 package
+  Speed: 30 km/h
+  Service_time_per_customer: 3 min
+  Receive_time_at_depot (δt): 5 min
+
+# ------------------------
+# Drone parameters
+# ------------------------
+Drone:
+  Model: Avidrone 210TL
+  Manufacturer: Avidrone Aerospace (2021)
+  Payload_capacity: 25 kg
+  Flight_endurance: 90 min
+  Working_speed: 60 km/h
+  Distance_metric: Euclidean
+  Handling_times:
+    δm (en-route meet): 5 min
+    δd (depot meet): 5 min
+  Load_capacity_Q:
+    Small_instances (≤ 20 customers): 2 orders
+    Large_instances: 10 orders
+  Order_weight: qi = 1, ∀i ∈ N
+
+  -- Number of trucks = number of drones = 2
+
+  Lưu ý: mỗi lần truck “phục vụ” tại depot (tức là ghé depot giữa chừng) thì chỉ mất đúng δt thời gian

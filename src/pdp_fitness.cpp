@@ -37,6 +37,20 @@ static double packageRelease(const PDPData& data, int pkg) {
     return (double)data.readyTimes[pkg];
 }
 
+static bool containsPackage(const vector<int>& packages, int pkg) {
+    return find(packages.begin(), packages.end(), pkg) != packages.end();
+}
+
+static int findPickupForDelivery(const PDPData& data, int dl) {
+    if (dl <= 0 || dl >= data.numNodes) return -1;
+    for (int p = 1; p < data.numNodes; ++p) {
+        if (data.pairIds[p] == data.pairIds[dl] && data.nodeTypes[p] == "P") {
+            return p;
+        }
+    }
+    return -1;
+}
+
 struct DroneTry {
     bool feasible = false;
     int drone_id = -1;
@@ -49,7 +63,8 @@ static DroneTry tryAssignDroneTrip(const PDPData& data,
                                   int truck_id,
                                   int rendezvous,
                                   const vector<int>& packages,
-                                  double truck_arrive_time) {
+                                  double truck_sync_time,
+                                  const RouteStop* fixed_stop = nullptr) {
     DroneTry best;
     best.feasible = false;
 
@@ -70,35 +85,60 @@ static DroneTry tryAssignDroneTrip(const PDPData& data,
     }
 
     for (int d = 0; d < data.numDrones; ++d) {
+        if (fixed_stop != nullptr && fixed_stop->fixed_drone_id >= 0 &&
+            d != fixed_stop->fixed_drone_id) {
+            continue;
+        }
         ResupplyEvent ev;
         ev.customer_ids = packages;
         ev.resupply_point = rendezvous;
         ev.drone_id = d;
         ev.truck_id = truck_id;
 
-        const double depReady = max(droneAvail[d] > 0 ? (droneAvail[d] + data.depotDroneLoadTime) : 0.0, maxRelease);
-        ev.drone_depart_time = depReady;
-        ev.drone_arrive_time = depReady + flyOut;
+        const bool fixedTiming = fixed_stop != nullptr &&
+            fixed_stop->fixed_drone_depart >= 0.0;
+        const double earliestDepart = max(droneAvail[d], maxRelease) + data.depotDroneLoadTime;
+        const double latestNoWaitDepart = truck_sync_time - flyOut;
+        ev.drone_depart_time = fixedTiming
+            ? fixed_stop->fixed_drone_depart
+            : max(earliestDepart, latestNoWaitDepart);
+        ev.drone_arrive_time = fixedTiming
+            ? fixed_stop->fixed_drone_arrive
+            : ev.drone_depart_time + flyOut;
 
-        ev.truck_arrive_time = truck_arrive_time;
-        ev.resupply_start_time = max(ev.drone_arrive_time, ev.truck_arrive_time);
+        // Store the time when the truck is actually ready to synchronize:
+        // arrival time for "receive before service", or service completion time
+        // for "serve before receive".
+        ev.truck_arrive_time = truck_sync_time;
+        ev.resupply_start_time = max(ev.drone_arrive_time, truck_sync_time);
         ev.resupply_end_time = ev.resupply_start_time + data.resupplyTime;
 
         const double drone_wait = ev.resupply_start_time - ev.drone_arrive_time;
-        ev.total_flight_time = flyOut + drone_wait + flyBack;
-        ev.drone_return_time = ev.resupply_end_time + flyBack;
+        // Endurance is measured from drone departure until return, including
+        // waiting at rendezvous and the physical handover duration.
+        ev.total_flight_time = flyOut + drone_wait + data.resupplyTime + flyBack;
+        ev.drone_return_time = fixedTiming
+            ? fixed_stop->fixed_drone_return
+            : ev.resupply_end_time + flyBack;
 
-        const double truck_wait = max(0.0, ev.drone_arrive_time - ev.truck_arrive_time);
+        const double truck_wait = max(0.0, ev.drone_arrive_time - truck_sync_time);
 
         const bool enduranceOK = (ev.total_flight_time <= data.droneEndurance + 1e-9);
         const bool waitOK = (truck_wait <= data.allowedWait + 1e-9);
 
-        const bool feasible = enduranceOK && waitOK;
+        const bool timingOK = !fixedTiming || (
+            ev.drone_depart_time + 1e-6 >= maxRelease + data.depotDroneLoadTime &&
+            fabs(ev.drone_arrive_time - ev.drone_depart_time - flyOut) <= 1e-5 &&
+            ev.drone_return_time + 1e-6 >= ev.resupply_end_time + flyBack);
+        const bool feasible = enduranceOK && waitOK && timingOK;
         if (!feasible) {
             continue;
         }
 
-        if (!best.feasible || ev.resupply_end_time < best.ev.resupply_end_time) {
+        if (!best.feasible ||
+            ev.resupply_end_time < best.ev.resupply_end_time ||
+            (fabs(ev.resupply_end_time - best.ev.resupply_end_time) <= 1e-9 &&
+             ev.drone_return_time < best.ev.drone_return_time)) {
             best.feasible = true;
             best.drone_id = d;
             best.ev = ev;
@@ -196,6 +236,18 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
                     logVisit(data.depotIndex, arr, arr);
                 }
 
+                // A depot visit closes the current truck trip. C1 packages
+                // supplied at a depot or by a drone must be delivered before
+                // that boundary; C2 pickup loads may remain onboard.
+                if (idx > 0) {
+                    for (int p : onboard) {
+                        if (p > 0 && p < (int)data.nodeTypes.size() &&
+                            data.nodeTypes[p] != "P" && data.nodeTypes[p] != "DL") {
+                            addPenalty(1e4, "C1 package still onboard at end of truck trip");
+                        }
+                    }
+                }
+
                 if (!st.packages.empty()) {
                     double maxRel = 0.0;
                     double loadW = 0.0;
@@ -216,7 +268,10 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
                         info.departure_times[0] = dep;
                     } else {
                         dep = max(arr + data.depotReceiveTime, maxRel);
-                        logVisit(data.depotIndex, arr, dep);
+                        if (!info.route.empty() && info.route.back() == data.depotIndex)
+                            info.departure_times.back() = dep;
+                        else
+                            logVisit(data.depotIndex, arr, dep);
                     }
 
                     if (onboardLoad + loadW > (double)data.truckCapacity + 1e-9) {
@@ -229,6 +284,12 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
                     onboardLoad += loadW;
 
                     t = dep;
+                } else if (idx > 0 && idx + 1 < route.size()) {
+                    // An intermediate depot stop starts a new truck trip. The
+                    // final return has no handling time.
+                    t += data.depotReceiveTime;
+                    if (!info.departure_times.empty())
+                        info.departure_times.back() = t;
                 }
 
                 // End depot node (0 without packages) handled implicitly.
@@ -251,8 +312,40 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
             t = arrive;
             pos = i;
 
-            // Drone resupply at i[P] before serving i
-            if (!st.packages.empty()) {
+            auto serveCustomer = [&]() {
+                if (i > 0 && i < (int)data.nodeTypes.size()) {
+                    string type = data.nodeTypes[i];
+                    if (type == "P") {
+                        onboard.insert(i);
+                        onboardLoad += packageWeight(data, i);
+                    } else if (type == "DL") {
+                        int pickupNode = findPickupForDelivery(data, i);
+                        if (pickupNode == -1 || !onboard.count(pickupNode)) {
+                            addPenalty(1e4, "Corresponding C2 Pickup package not onboard before C2 Delivery service");
+                        } else {
+                            onboard.erase(pickupNode);
+                            onboardLoad -= packageWeight(data, pickupNode);
+                        }
+                    } else { // "D" or other types: Delivery C1
+                        if (!onboard.count(i)) {
+                            addPenalty(1e4, "Package not available before C1 service");
+                        } else {
+                            onboard.erase(i);
+                            onboardLoad -= packageWeight(data, i);
+                        }
+                    }
+                } else {
+                    addPenalty(1e4, "Invalid customer node index");
+                }
+
+                if (onboardLoad > (double)data.truckCapacity + 1e-9) {
+                    addPenalty(1e4, "Truck capacity exceeded after service");
+                }
+
+                t += data.truckServiceTime;
+            };
+
+            auto receiveDrone = [&](double truck_sync_time) {
                 // Disallow supplying packages that are served earlier in the route (position rule)
                 // This is a structural check; detailed repair happens in GA operators.
                 // Here we only ensure packages are valid customer ids.
@@ -267,67 +360,58 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
                     }
                 }
 
-                DroneTry best = tryAssignDroneTrip(data, droneAvail, k, i, st.packages, t);
+                const RouteStop* fixedStop = st.fixed_drone_id >= 0 ? &st : nullptr;
+                DroneTry best = tryAssignDroneTrip(
+                    data, droneAvail, k, i, st.packages, truck_sync_time, fixedStop);
                 if (!best.feasible) {
                     addPenalty(1e4, "Infeasible drone trip (capacity/endurance/wait)");
-                } else {
-                    // Truck may wait; then resupply handover
-                    t = best.ev.resupply_end_time;
-                    droneAvail[best.drone_id] = best.ev.drone_return_time;
+                    return;
+                }
 
-                    const int evIndex = (int)sol.resupply_events.size();
-                    sol.resupply_events.push_back(best.ev);
-                    sol.drone_order.push_back(evIndex);
+                t = best.ev.resupply_end_time;
+                droneAvail[best.drone_id] = max(
+                    droneAvail[best.drone_id], best.ev.drone_return_time);
 
-                    for (int p : st.packages) {
+                const int evIndex = (int)sol.resupply_events.size();
+                sol.resupply_events.push_back(best.ev);
+                sol.drone_order.push_back(evIndex);
+
+                for (int p : st.packages) {
+                    if (!onboard.count(p)) {
                         onboard.insert(p);
                         onboardLoad += packageWeight(data, p);
                     }
-                    if (onboardLoad > (double)data.truckCapacity + 1e-9) {
-                        addPenalty(1e4, "Truck capacity exceeded after resupply");
-                    }
                 }
-            }
+                if (onboardLoad > (double)data.truckCapacity + 1e-9) {
+                    addPenalty(1e4, "Truck capacity exceeded after resupply");
+                }
+            };
 
-            // Serve i
-            if (i > 0 && i < (int)data.nodeTypes.size()) {
-                string type = data.nodeTypes[i];
+            bool serveBeforeDrone = false;
+            if (!st.packages.empty() && i > 0 && i < (int)data.nodeTypes.size()) {
+                const string& type = data.nodeTypes[i];
+                const bool currentPkgFromDrone = containsPackage(st.packages, i);
                 if (type == "P") {
-                    onboard.insert(i);
-                    onboardLoad += packageWeight(data, i);
+                    serveBeforeDrone = true;
                 } else if (type == "DL") {
-                    int pickupNode = -1;
-                    for (int p = 1; p < data.numNodes; ++p) {
-                        if (data.pairIds[p] == data.pairIds[i] && data.nodeTypes[p] == "P") {
-                            pickupNode = p;
-                            break;
-                        }
-                    }
-                    if (pickupNode == -1 || !onboard.count(pickupNode)) {
-                        addPenalty(1e4, "Corresponding C2 Pickup package not onboard before C2 Delivery service");
-                    } else {
-                        onboard.erase(pickupNode);
-                        onboardLoad -= packageWeight(data, i);
-                    }
-                } else { // "D" or other types: Delivery C1
-                    if (!onboard.count(i)) {
-                        addPenalty(1e4, "Package not available before C1 service");
-                    } else {
-                        onboard.erase(i);
-                        onboardLoad -= packageWeight(data, i);
-                    }
+                    int pickupNode = findPickupForDelivery(data, i);
+                    serveBeforeDrone = (pickupNode != -1 && onboard.count(pickupNode) > 0);
+                } else {
+                    serveBeforeDrone = (onboard.count(i) > 0 && !currentPkgFromDrone);
                 }
+            }
+
+            if (!st.packages.empty() && serveBeforeDrone) {
+                serveCustomer();
+                receiveDrone(t);
             } else {
-                addPenalty(1e4, "Invalid customer node index");
+                if (!st.packages.empty()) {
+                    receiveDrone(t);
+                }
+                serveCustomer();
             }
 
-            if (onboardLoad > (double)data.truckCapacity + 1e-9) {
-                addPenalty(1e4, "Truck capacity exceeded after service");
-            }
-
-            const double depart = t + data.truckServiceTime;
-            logVisit(i, arrive, depart);
-            t = depart;
+            logVisit(i, arrive, t);
         }
 
         // Ensure truck returns to depot at end
@@ -352,6 +436,7 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
 
     double makespan = 0.0;
     for (const auto& td : sol.truck_details) makespan = max(makespan, td.completion_time);
+    for (double dt : sol.drone_completion_times) makespan = max(makespan, dt);
     sol.totalCost = makespan;
 
     return sol;
@@ -372,6 +457,11 @@ void print_decoded_routes(const PDPSolution& sol, const PDPData& data) {
             if (i + 1 < tr.route.size()) cout << " -> ";
         }
         cout << " | finish=" << fixed << setprecision(2) << tr.completion_time << "\n";
+        for (size_t i = 0; i < tr.route.size(); ++i) {
+            cout << "  stop " << tr.route[i]
+                 << " arr=" << fixed << setprecision(2) << tr.arrival_times[i]
+                 << " dep=" << tr.departure_times[i] << "\n";
+        }
     }
 
     cout << "\n[DRONE TRIPS]\n";

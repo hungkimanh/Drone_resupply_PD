@@ -442,7 +442,7 @@ TSResult tabuSearch(const PDPData& data,
 
             // Score: 3 = new best, 1 = accepted no improvement, 0 = fallback did the work
             int score;
-            if (lsp.objective < z_star) {
+            if (lsp.feasible && lsp.objective < z_star) {
                 z_star   = lsp.objective;
                 chi_star = chi_curr;
                 best_lsp = lsp;
@@ -493,7 +493,7 @@ TSResult tabuSearch(const PDPData& data,
                 LSPResult lsp_alns = evaluateRoutes(data, chi_alns, cfg.lsp_cutoff,
                                                     z_star - cfg.cutoff_eps);
                 int ascore = 0;
-                if (lsp_alns.objective < z_star) {
+                if (lsp_alns.feasible && lsp_alns.objective < z_star) {
                     z_star   = lsp_alns.objective;
                     chi_star = chi_alns;
                     best_lsp = lsp_alns;
@@ -501,7 +501,7 @@ TSResult tabuSearch(const PDPData& data,
                     ascore   = 2;
                     if (cfg.verbose)
                         cout << "[ALNS] NEW BEST z=" << z_star << "\n";
-                } else if (lsp_alns.objective < best_lsp.objective * 1.05) {
+                } else if (lsp_alns.feasible && lsp_alns.objective < best_lsp.objective * 1.05) {
                     ascore = 1;
                 }
                 alns_w.updateDestroy(d_op, ascore);

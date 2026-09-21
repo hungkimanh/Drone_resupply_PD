@@ -15,7 +15,7 @@
  *   Each Route_k is a list of RouteStop:
  *     - 0[P]  depot load packages P
  *     - i     serve customer i
- *     - i[P]  drone resupply packages P at i (before serving i)
+ *     - i[P]  drone resupply packages P at i, synchronized with service at i
  *     - 0     end route
  */
 PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data,

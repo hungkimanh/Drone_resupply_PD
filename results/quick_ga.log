@@ -1,5 +1,0 @@
-[GA] start pop=30 gen=3 mut=0.2 customers=10 trucks=2 drones=2
-[GA] gen=-1 feasible=30/30 bestFitness=193 bestCmax=193 bestPenalty=0 avgFitness=225.833
-[GA] gen=0 feasible=26/30 bestFitness=193 bestCmax=193 bestPenalty=0 avgFitness=4215.97 children=29 twoPoint=16 mutCustomer=4 mutDrone=9 globalBestCmax=193 globalBestPenalty=0 globalBestFeasible=1
-[GA] gen=1 feasible=20/30 bestFitness=186 bestCmax=186 bestPenalty=0 avgFitness=18873.7 children=29 twoPoint=14 mutCustomer=8 mutDrone=9 globalBestCmax=186 globalBestPenalty=0 globalBestFeasible=1
-[GA] gen=2 feasible=23/30 bestFitness=186 bestCmax=186 bestPenalty=0 avgFitness=9208.5 children=29 twoPoint=13 mutCustomer=5 mutDrone=10 globalBestCmax=186 globalBestPenalty=0 globalBestFeasible=1

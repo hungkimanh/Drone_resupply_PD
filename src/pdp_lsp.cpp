@@ -271,10 +271,17 @@ LSPResult solveLSP(const PDPData& data,
         int64_t t_first = sc(data.truckDistMatrix[0][vrp[v][0]]);
         cp.AddEquality(TA[v][0], T0[v] + t_first);
 
-        // TA[v][k] = Tv[v][k-1] + direct_travel(c_{k-1} → c_k)  for k>=1
+        // TA is the actual arrival time. Returning to the depot changes both
+        // travel time and the rendezvous synchronization time.
         for (int k = 1; k < m; ++k) {
-            int64_t tt = sc(data.truckDistMatrix[vrp[v][k-1]][vrp[v][k]]);
-            cp.AddEquality(TA[v][k], Tv[v][k-1] + tt);
+            int64_t direct = sc(data.truckDistMatrix[vrp[v][k-1]][vrp[v][k]]);
+            int64_t via_depot = sc(data.truckDistMatrix[vrp[v][k-1]][0])
+                              + depot_recv
+                              + sc(data.truckDistMatrix[0][vrp[v][k]]);
+            cp.AddEquality(TA[v][k], Tv[v][k-1] + direct)
+              .OnlyEnforceIf(depot_return[v][k].Not());
+            cp.AddEquality(TA[v][k], Tv[v][k-1] + via_depot)
+              .OnlyEnforceIf(depot_return[v][k]);
         }
 
         for (int k = 0; k < m; ++k) {
@@ -306,16 +313,6 @@ LSPResult solveLSP(const PDPData& data,
             cp.AddLessOrEqual(svars[s_rs].dr_arr, TA[v][k] + allow_wait)
               .OnlyEnforceIf(svars[s_rs].active);
 
-            // DR: Tv[v][k] >= Tv[v][k-1] + via_depot_travel + svc  [if depot_return]
-            // via_depot = travel(c_{k-1}→depot) + depot_recv + travel(depot→c_k)
-            // Δ_{k-1,k} = via_depot - direct_travel  (paper equation)
-            if (k >= 1) {
-                int64_t via_depot = sc(data.truckDistMatrix[vrp[v][k-1]][0])
-                                  + depot_recv
-                                  + sc(data.truckDistMatrix[0][vrp[v][k]]);
-                cp.AddGreaterOrEqual(Tv[v][k], Tv[v][k-1] + via_depot + svc)
-                  .OnlyEnforceIf(depot_return[v][k]);
-            }
         }
     }
 
@@ -367,8 +364,6 @@ LSPResult solveLSP(const PDPData& data,
             int s_dr        = gslot_dr(v, k);
             int64_t t_d_ck  = sc(data.truckDistMatrix[0][vrp[v][k]]);
 
-            LinearExpr dr_count; // sum of b_i for packages at DR(v,k)
-
             for (int i = 0; i < nP; ++i) {
                 if (pkgs[i].truck != v || pkgs[i].pos < k) continue;
                 // gslot_dr(v,k) in domain iff k in [1..ki] — guaranteed since pos>=k and k>=1
@@ -385,16 +380,96 @@ LSPResult solveLSP(const PDPData& data,
 
                 // If this package uses DR(v,k), truck must return to depot before k
                 cp.AddImplication(b, depot_return[v][k]);
-                dr_count += LinearExpr::Term(b, 1);
             }
-
-            // depot_return[v][k] = 0 if no packages assigned to this DR slot
-            // (optimizer has no incentive to set it =1 for free, but be explicit for correctness)
-            cp.AddLessOrEqual(LinearExpr(depot_return[v][k]), dr_count);
         }
     }
 
-    // ---- 5. CMAX ----
+    // ---- 5. C1 packages must be delivered within their source trip ----
+    // A depot return is a trip boundary. Initial-depot and drone-supplied C1
+    // packages cannot cross one; a package loaded by DR(v,j) may cross that
+    // boundary j, but no later boundary before its delivery.
+    for (int i = 0; i < nP; ++i) {
+        const int v = pkgs[i].truck;
+        const int delivery_pos = pkgs[i].pos;
+
+        auto forbid_later_returns = [&](int source, int first_boundary) {
+            BoolVar selected = cp.NewBoolVar();
+            cp.AddEquality(assign[i], source).OnlyEnforceIf(selected);
+            cp.AddNotEqual(assign[i], source).OnlyEnforceIf(selected.Not());
+            for (int k = first_boundary; k <= delivery_pos; ++k)
+                cp.AddImplication(selected, depot_return[v][k].Not());
+        };
+
+        forbid_later_returns(0, 1); // Initial depot load
+        for (int j = 0; j <= delivery_pos; ++j)
+            forbid_later_returns(gslot_rs(v, j), j + 1);
+        for (int j = 1; j <= delivery_pos; ++j)
+            forbid_later_returns(gslot_dr(v, j), j + 1);
+    }
+
+    // ---- 6. Truck capacity before and after every customer ----
+    // C1 packages contribute after their selected source is reached and until
+    // delivery. C2 pickup loads persist across intermediate depot returns.
+    const int64_t truck_cap = static_cast<int64_t>(data.truckCapacity);
+    for (int v = 0; v < nT; ++v) {
+        const int m = static_cast<int>(vrp[v].size());
+        if (m == 0) continue;
+
+        std::unordered_map<int, int> route_pos;
+        for (int k = 0; k < m; ++k) route_pos[vrp[v][k]] = k;
+
+        for (int k = 0; k < m; ++k) {
+            LinearExpr load_before;
+            LinearExpr load_after;
+
+            for (int p = 1; p < data.numNodes; ++p) {
+                if (!isP(data, p)) continue;
+                auto p_it = route_pos.find(p);
+                if (p_it == route_pos.end()) continue;
+
+                int dl = -1;
+                for (int n = 1; n < data.numNodes; ++n) {
+                    if (isDL(data, n) && data.pairIds[n] == data.pairIds[p]) {
+                        dl = n;
+                        break;
+                    }
+                }
+                auto d_it = route_pos.find(dl);
+                if (dl < 0 || d_it == route_pos.end()) continue;
+
+                const int kp = p_it->second;
+                const int kd = d_it->second;
+                const int64_t q = static_cast<int64_t>(data.demands[p]);
+                if (kp < k && k <= kd) load_before += q;
+                if (kp <= k && k < kd) load_after += q;
+            }
+
+            for (int i = 0; i < nP; ++i) {
+                if (pkgs[i].truck != v || pkgs[i].pos < k) continue;
+
+                const bool in_before = pkgs[i].pos >= k;
+                const bool in_after  = pkgs[i].pos > k;
+                auto add_source = [&](int source) {
+                    BoolVar selected = cp.NewBoolVar();
+                    cp.AddEquality(assign[i], source).OnlyEnforceIf(selected);
+                    cp.AddNotEqual(assign[i], source).OnlyEnforceIf(selected.Not());
+                    if (in_before)
+                        load_before += LinearExpr::Term(selected, pkgs[i].demand);
+                    if (in_after)
+                        load_after += LinearExpr::Term(selected, pkgs[i].demand);
+                };
+
+                add_source(0);
+                for (int j = 0; j <= k; ++j) add_source(gslot_rs(v, j));
+                for (int j = 1; j <= k; ++j) add_source(gslot_dr(v, j));
+            }
+
+            cp.AddLessOrEqual(load_before, truck_cap);
+            cp.AddLessOrEqual(load_after, truck_cap);
+        }
+    }
+
+    // ---- 7. CMAX ----
     IntVar cmax = cp.NewIntVar({0, INF_T});
 
     for (int v = 0; v < nT; ++v) {
@@ -415,7 +490,12 @@ LSPResult solveLSP(const PDPData& data,
             cp.AddHint(cmax, sc(ws.totalCost));
     }
 
-    cp.Minimize(cmax);
+    // Minimize makespan first, then the number of truck trips.
+    LinearExpr objective = LinearExpr::Term(cmax, total_dr + 1);
+    for (int v = 0; v < nT; ++v)
+        for (int k = 1; k < (int)vrp[v].size(); ++k)
+            objective += LinearExpr::Term(depot_return[v][k], 1);
+    cp.Minimize(objective);
 
     // ---- Solve ----
     SatParameters params;
@@ -429,11 +509,11 @@ LSPResult solveLSP(const PDPData& data,
                       response.status() == CpSolverStatus::FEASIBLE);
 
     if (!cp_solved) {
-        result.solved   = true;
-        result.feasible = true;
-        result.encoding = warm_start;
         PDPSolution gs  = decode_solution(warm_start, data, false);
-        result.objective = gs.totalCost;
+        result.solved   = true;
+        result.feasible = gs.isFeasible;
+        result.encoding = warm_start;
+        result.objective = gs.isFeasible ? gs.totalCost : std::numeric_limits<double>::infinity();
         return result;
     }
 
@@ -475,13 +555,14 @@ LSPResult solveLSP(const PDPData& data,
         for (int k = 0; k < (int)vrp[v].size(); ++k) {
             int node = vrp[v][k];
 
-            // Insert intermediate depot return BEFORE this customer if any DR packages
+            // Insert every split selected by LSP. A split may carry no newly
+            // loaded packages; pickup loads already onboard are preserved.
             if (k >= 1) {
                 auto dit = tb[v].dr_before.find(k);
-                if (dit != tb[v].dr_before.end() && !dit->second.empty()) {
-                    // RouteStop(0, pkgs): truck goes back to depot and loads these
-                    r.push_back(RouteStop(0, dit->second));
-                }
+                std::vector<int> depot_pkgs;
+                if (dit != tb[v].dr_before.end()) depot_pkgs = dit->second;
+                if (SolutionBooleanValue(response, depot_return[v][k]))
+                    r.push_back(RouteStop(0, std::move(depot_pkgs)));
             }
 
             // Customer visit, with possible drone resupply
@@ -501,11 +582,14 @@ LSPResult solveLSP(const PDPData& data,
     {
         PDPSolution actual = decode_solution(enc, data, false);
         if (actual.isFeasible) {
+            result.feasible = true;
             result.objective = actual.totalCost;
         } else {
             // Fall back to greedy if CP-SAT produced an infeasible schedule
+            PDPSolution gs = decode_solution(warm_start, data, false);
             result.encoding  = warm_start;
-            result.objective = decode_solution(warm_start, data, false).totalCost;
+            result.feasible  = gs.isFeasible;
+            result.objective = gs.isFeasible ? gs.totalCost : std::numeric_limits<double>::infinity();
         }
     }
 

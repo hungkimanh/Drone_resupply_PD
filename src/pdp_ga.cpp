@@ -151,26 +151,32 @@ static double pkgWeight(const PDPData& data, int p) {
     return (double)data.demands[p];
 }
 
-static void repairInvalidResupplyPositions(SolutionEncoding& child) {
-    auto idx = buildCustomerIndex(child);
+static void repairInvalidResupplyPositions(SolutionEncoding& child, const PDPData& data) {
     for (auto& r : child) {
-        // Build customer positions within this route
-        vector<int> customers;
-        customers.reserve(r.size());
-        for (const auto& st : r) if (st.node > 0) customers.push_back(st.node);
-        unordered_map<int,int> pos;
-        for (int i = 0; i < (int)customers.size(); ++i) pos[customers[i]] = i;
+        unordered_map<int,int> stopPos;
+        for (int i = 0; i < (int)r.size(); ++i)
+            if (r[i].node > 0) stopPos[r[i].node] = i;
 
-        for (auto& st : r) {
+        for (int sourceIdx = 0; sourceIdx < (int)r.size(); ++sourceIdx) {
+            auto& st = r[sourceIdx];
             if (st.node <= 0 || st.packages.empty()) continue;
-            const int h = st.node;
-            const int posH = pos[h];
             vector<int> kept;
             kept.reserve(st.packages.size());
             for (int p : st.packages) {
-                auto it = pos.find(p);
-                if (it == pos.end()) continue;
-                if (it->second < posH) continue;
+                if (p <= 0 || p >= (int)data.nodeTypes.size()) continue;
+                if (data.nodeTypes[p] == "P" || data.nodeTypes[p] == "DL") continue;
+
+                auto it = stopPos.find(p);
+                if (it == stopPos.end() || it->second < sourceIdx) continue;
+
+                bool crossesDepot = false;
+                for (int k = sourceIdx + 1; k <= it->second; ++k) {
+                    if (r[k].node == 0) {
+                        crossesDepot = true;
+                        break;
+                    }
+                }
+                if (crossesDepot) continue;
                 kept.push_back(p);
             }
             st.packages.swap(kept);
@@ -385,7 +391,8 @@ static void rebuildDepotLoadsForRoute(Route& r, const PDPData& data) {
 
         for (int j = depotIdx + 1; j < (int)r.size(); ++j) {
             const int node = r[j].node;
-            if (node <= 0) continue;
+            if (node == 0) break;
+            if (node < 0) continue;
             const int pkg = node;
             if (onboard.count(pkg)) continue;
 
@@ -495,7 +502,7 @@ void repairSolution(SolutionEncoding& child, const PDPData& data) {
     // 1) Repair customer uniqueness is assumed from crossover; we keep it minimal here.
 
     // 2) Remove duplicated package supply (resupply vs depot load, and multiple resupplies)
-    repairInvalidResupplyPositions(child);
+    repairInvalidResupplyPositions(child, data);
     repairDroneCapacity(child, data);
     dedupPackageSupply(child);
 

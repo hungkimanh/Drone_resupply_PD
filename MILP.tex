@@ -1,0 +1,609 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\setmainfont{Times New Roman}
+\setlength{\oddsidemargin}{0cm}
+\setlength{\evensidemargin}{0cm}
+\setlength{\textwidth}{16cm}
+\setlength{\topmargin}{-1cm}
+\setlength{\textheight}{24.5cm}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\title{Mô hình MILP cho bài toán Truck--Drone Resupply PDP}
+\author{Mô hình một điểm hẹn cho mỗi chuyến drone, xe tải nhiều chuyến}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Mô tả bài toán}
+
+Bài toán xét một đội xe tải và drone xuất phát từ depot \(0\) để phục vụ tập khách
+hàng \(N\). Mỗi khách hàng được xe tải ghé đúng một lần. Với khách hàng giao hàng
+trực tiếp \(i\in N^D\), kiện hàng của \(i\) có thể được chất lên xe tải tại depot
+đầu một chuyến truck, hoặc được drone mang từ depot tới một điểm hẹn trên hành trình
+truck. Kiện C1 phải được giao trước khi truck quay lại depot kết thúc chuyến đã nhận
+kiện đó. Với cặp pickup--delivery \((p,\ell)\in\mathcal A\), pickup \(p\) và delivery
+\(\ell\) phải nằm trên cùng một truck, và delivery phải nằm sau pickup trong toàn
+hành trình của truck đó.
+
+Mỗi truck có thể đi nhiều chuyến. Mỗi chuyến truck có dạng
+\[
+  0 \rightarrow \cdots \rightarrow 0.
+\]
+Khi truck quay lại depot để bắt đầu chuyến tiếp theo, truck không bắt buộc phải rỗng:
+hàng đã pickup ở một khách hàng có thể được giữ trên truck để giao cho delivery tương
+ứng ở chuyến sau, miễn là capacity truck luôn được tôn trọng. Lần xuất phát đầu tiên
+từ depot không tính thời gian bốc dỡ truck; từ chuyến thứ hai trở đi có tính thời gian
+bốc dỡ tại depot. Lần cuối truck quay về depot để kết thúc hành trình không tính thêm
+thời gian bốc dỡ.
+
+Mỗi chuyến drone chỉ có một điểm hẹn với một truck tại một khách hàng. Drone xuất
+phát từ depot, bay tới điểm hẹn, bàn giao hàng cho truck, rồi quay về depot:
+\[
+  0 \rightarrow h \rightarrow 0.
+\]
+Mô hình này không dùng multi-rendezvous cho drone.
+
+\paragraph{Khoảng cách và vận tốc.}
+Truck dùng khoảng cách Manhattan, vận tốc \(30\) km/h. Drone dùng khoảng cách
+Euclidean, vận tốc \(60\) km/h. Thời gian di chuyển tính theo phút:
+\[
+  t^T_{ij}=\frac{|x_i-x_j|+|y_i-y_j|}{30}\cdot 60,\qquad
+  t^D_{ij}=\frac{\sqrt{(x_i-x_j)^2+(y_i-y_j)^2}}{60}\cdot 60.
+\]
+
+\section{Tập chỉ số và tham số}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+Ký hiệu & Ý nghĩa\\
+\midrule
+\(0\) & depot\\
+\(N\) & tập khách hàng\\
+\(N^D\) & tập khách hàng giao hàng trực tiếp, loại \texttt{D}\\
+\(N^P\) & tập node pickup, loại \texttt{P}\\
+\(N^{DL}\) & tập node delivery của pickup--delivery, loại \texttt{DL}\\
+\(\mathcal A\) & tập cặp pickup--delivery \((p,\ell)\)\\
+\(K\) & tập truck\\
+\(R\) & tập drone\\
+\(H=\{1,\ldots,H_{\max}\}\) & tập chuyến tiềm năng của mỗi truck\\
+\(P=\{1,\ldots,P_{\max}\}\) & tập vị trí tiềm năng trong một chuyến truck\\
+\(S=\{1,\ldots,S_{\max}\}\) & tập chuyến bay tiềm năng của mỗi drone\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+Ký hiệu & Ý nghĩa\\
+\midrule
+\(q_i\) & khối lượng kiện hàng của khách \(i\)\\
+\(r_i\) & release date của kiện hàng \(i\)\\
+\(Q_T\) & tải trọng truck\\
+\(Q_D\) & tải trọng drone\\
+\(s_T\) & thời gian truck phục vụ một khách hàng\\
+\(\delta_m\) & thời gian bàn giao drone--truck tại điểm hẹn\\
+\(\delta_d\) & thời gian drone chất hàng tại depot trước mỗi chuyến bay\\
+\(\delta_T\) & thời gian truck bốc dỡ tại depot trước chuyến truck thứ hai trở đi\\
+\(E\) & endurance tối đa của một chuyến bay drone\\
+\(M\) & hằng số Big-M đủ lớn\\
+\(t^T_{ij}\) & thời gian truck đi từ \(i\) đến \(j\)\\
+\(t^D_{ij}\) & thời gian drone bay từ \(i\) đến \(j\)\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Biến quyết định}
+
+\subsection{Route truck}
+
+\[
+y_{kmpi}=
+\begin{cases}
+1, & \text{nếu truck }k\text{ phục vụ khách }i\text{ ở vị trí }p
+\text{ trong chuyến }m,\\
+0, & \text{ngược lại,}
+\end{cases}
+\]
+\[
+u_{kmp}=
+\begin{cases}
+1, & \text{nếu vị trí }p\text{ của chuyến }m\text{ của truck }k\text{ được dùng,}\\
+0, & \text{ngược lại,}
+\end{cases}
+\]
+\[
+g_{km}=
+\begin{cases}
+1, & \text{nếu chuyến }m\text{ của truck }k\text{ được dùng,}\\
+0, & \text{ngược lại.}
+\end{cases}
+\]
+\[
+z_{kmpij}=
+\begin{cases}
+1, & \text{nếu trong chuyến }m\text{ của truck }k,\ i\text{ ở vị trí }p
+\text{ và }j\text{ ở }p+1,\\
+0, & \text{ngược lại,}
+\end{cases}
+\]
+\[
+\lambda_{kmpi}=
+\begin{cases}
+1, & \text{nếu }i\text{ là khách cuối của chuyến }m\text{ của truck }k
+\text{ tại vị trí }p,\\
+0, & \text{ngược lại.}
+\end{cases}
+\]
+
+\subsection{Nguồn hàng và drone}
+
+\[
+a_{kmi}=
+\begin{cases}
+1, & \text{nếu kiện C1 }i\text{ được chất lên truck }k\text{ tại depot đầu chuyến }m,\\
+0, & \text{ngược lại,}
+\end{cases}
+\]
+\[
+b_{kmpi}=
+\begin{cases}
+1, & \text{nếu kiện C1 }i\text{ được drone giao cho truck }k
+\text{ tại vị trí }p\text{ của chuyến }m,\\
+0, & \text{ngược lại,}
+\end{cases}
+\]
+\[
+o_{kmpi}=
+\begin{cases}
+1, & \text{nếu node tại vị trí }p\text{ là }i\text{ và kiện }i
+     \text{ được nhận từ drone tại chính vị trí đó},\\
+0, & \text{ngược lại.}
+\end{cases}
+\]
+Biến phụ $o_{kmpi}$ được tuyến tính hóa bởi
+\begin{equation}
+o_{kmpi}\le y_{kmpi},\qquad
+o_{kmpi}\le b_{kmpi},\qquad
+o_{kmpi}\ge y_{kmpi}+b_{kmpi}-1.
+\end{equation}
+\[
+\rho_{kmp}=
+\begin{cases}
+1, & \text{nếu có một chuyến drone hẹn truck }k\text{ tại vị trí }p
+\text{ của chuyến }m,\\
+0, & \text{ngược lại.}
+\end{cases}
+\]
+\[
+w_{dskmpj}=
+\begin{cases}
+1, & \text{nếu chuyến bay }s\text{ của drone }d\text{ gặp truck }k
+      \text{ trong chuyến }m,\\
+   & \text{tại vị trí }p\text{, node }j,\\
+0, & \text{ngược lại,}
+\end{cases}
+\]
+\[
+\eta_{ds}=
+\begin{cases}
+1, & \text{nếu chuyến bay }s\text{ của drone }d\text{ được dùng,}\\
+0, & \text{ngược lại.}
+\end{cases}
+\]
+
+\subsection{Thời gian và tải}
+
+\[
+T^0_{km}\ge0,\quad A_{kmp}\ge0,\quad D_{kmp}\ge0,\quad B_{km}\ge0,
+\]
+trong đó \(T^0_{km}\) là thời điểm truck \(k\) rời depot bắt đầu chuyến \(m\),
+\(A_{kmp}\), \(D_{kmp}\) là thời điểm truck đến/rời vị trí \(p\), và \(B_{km}\)
+là thời điểm truck quay về depot kết thúc chuyến \(m\).
+
+\[
+F^{dep}_{ds}\ge0,\quad F^{arr}_{ds}\ge0,\quad F^{ret}_{ds}\ge0,\quad C_{\max}\ge0.
+\]
+\[
+L_{kmp}\ge0,\quad L^{end}_{km}\ge0
+\]
+là tải trên truck \(k\) ngay sau khi rời vị trí \(p\) trong chuyến \(m\). Ký hiệu
+\(L_{km0}\) là tải truck ngay khi rời depot đầu chuyến \(m\), và \(L^{end}_{km}\)
+là tải còn trên truck khi chuyến \(m\) quay về depot. Tải còn lại này chỉ có thể là
+hàng pickup C2 chưa tới delivery tương ứng.
+
+\section{Hàm mục tiêu}
+
+\[
+  \min C_{\max}.
+\]
+
+\section{Ràng buộc}
+
+\subsection{Cấu trúc route truck nhiều chuyến}
+
+\begin{equation}
+  \sum_{i\in N} y_{kmpi}=u_{kmp},
+  \qquad \forall k\in K,\ m\in H,\ p\in P.
+\end{equation}
+
+\begin{equation}
+  u_{kmp}\le g_{km},
+  \qquad \forall k\in K,\ m\in H,\ p\in P.
+\end{equation}
+
+\begin{equation}
+  u_{km,p+1}\le u_{kmp},
+  \qquad \forall k\in K,\ m\in H,\ p=1,\ldots,P_{\max}-1.
+\end{equation}
+
+\begin{equation}
+  g_{k,m+1}\le g_{km},
+  \qquad \forall k\in K,\ m=1,\ldots,H_{\max}-1.
+\end{equation}
+
+\begin{equation}
+  \sum_{k\in K}\sum_{m\in H}\sum_{p\in P} y_{kmpi}=1,
+  \qquad \forall i\in N.
+\end{equation}
+
+\begin{equation}
+  z_{kmpij}\le y_{kmpi},\quad
+  z_{kmpij}\le y_{km,p+1,j},\quad
+  z_{kmpij}\ge y_{kmpi}+y_{km,p+1,j}-1,
+\end{equation}
+\[
+  \forall k\in K,\ m\in H,\ p=1,\ldots,P_{\max}-1,\ i,j\in N.
+\]
+
+\begin{equation}
+  \lambda_{kmpi}\le y_{kmpi},\quad
+  \lambda_{kmpi}\le u_{kmp}-u_{km,p+1},\quad
+  \lambda_{kmpi}\ge y_{kmpi}+u_{kmp}-u_{km,p+1}-1,
+\end{equation}
+\[
+  \forall k\in K,\ m\in H,\ p=1,\ldots,P_{\max}-1,\ i\in N.
+\]
+\begin{equation}
+  \lambda_{km,P_{\max},i}=y_{km,P_{\max},i},
+  \qquad \forall k\in K,\ m\in H,\ i\in N.
+\end{equation}
+
+\subsection{Pickup--delivery}
+
+Pickup và delivery của cùng một cặp phải nằm trên cùng một truck, nhưng có thể nằm
+ở hai chuyến khác nhau:
+\begin{equation}
+  \sum_{m\in H}\sum_{p\in P}y_{kmp p'}
+  =
+  \sum_{m\in H}\sum_{p\in P}y_{kmp \ell},
+  \qquad \forall k\in K,\ (p',\ell)\in\mathcal A.
+\end{equation}
+
+Pickup phải đứng trước delivery trong toàn hành trình của truck. Thứ tự toàn hành
+trình của vị trí \((m,p)\) được tính bởi \((m-1)P_{\max}+p\):
+\begin{equation}
+\begin{aligned}
+  &\sum_{m\in H}\sum_{p\in P}\big((m-1)P_{\max}+p\big)y_{kmp p'}+1\\
+  &\le
+  \sum_{m\in H}\sum_{p\in P}\big((m-1)P_{\max}+p\big)y_{kmp\ell}\\
+  &\quad +M\left(1-\sum_{m\in H}\sum_{p\in P}y_{kmp p'}\right),
+\end{aligned}
+\end{equation}
+\[
+  \forall k\in K,\ (p',\ell)\in\mathcal A.
+\]
+
+\subsection{Nguồn hàng cho khách C1}
+
+\begin{equation}
+  a_{kmi}+\sum_{p\in P}b_{kmpi}
+  =
+  \sum_{p\in P}y_{kmpi},
+  \qquad \forall k\in K,\ m\in H,\ i\in N^D.
+\end{equation}
+
+Do cả nguồn hàng và lần phục vụ đều mang cùng chỉ số chuyến \(m\), phương trình trên
+buộc mọi kiện C1 được chất tại depot hoặc nhận từ drone phải được giao trong chính
+chuyến truck đó; kiện C1 không thể được mang qua một lần quay về depot.
+
+\begin{equation}
+  b_{kmpi}\le \sum_{\substack{q\in P\\q\ge p}} y_{kmqi},
+  \qquad \forall k\in K,\ m\in H,\ p\in P,\ i\in N^D.
+\end{equation}
+
+\begin{equation}
+  b_{kmpi}\le \rho_{kmp},
+  \qquad \forall k\in K,\ m\in H,\ p\in P,\ i\in N^D.
+\end{equation}
+
+\begin{equation}
+  \rho_{kmp}\le u_{kmp},
+  \qquad \forall k\in K,\ m\in H,\ p\in P.
+\end{equation}
+
+\subsection{Drone capacity và gán chuyến drone}
+
+\begin{equation}
+  \sum_{i\in N^D}q_i b_{kmpi}\le Q_D\rho_{kmp},
+  \qquad \forall k\in K,\ m\in H,\ p\in P.
+\end{equation}
+
+\begin{equation}
+  \sum_{d\in R}\sum_{s\in S}\sum_{j\in N} w_{dskmpj}
+  =
+  \rho_{kmp},
+  \qquad \forall k\in K,\ m\in H,\ p\in P.
+\end{equation}
+\begin{equation}
+  w_{dskmpj}\le y_{kmpj},
+  \qquad \forall d\in R,\ s\in S,\ k\in K,\ m\in H,\ p\in P,\ j\in N.
+\end{equation}
+
+\begin{equation}
+  \sum_{k\in K}\sum_{m\in H}\sum_{p\in P}\sum_{j\in N}w_{dskmpj}
+  =\eta_{ds},
+  \qquad \forall d\in R,\ s\in S.
+\end{equation}
+
+\begin{equation}
+  \eta_{d,s+1}\le \eta_{ds},
+  \qquad \forall d\in R,\ s=1,\ldots,S_{\max}-1.
+\end{equation}
+
+\subsection{Truck capacity và tải chuyển tiếp giữa các chuyến}
+
+\begin{equation}
+  L_{k10}=\sum_{i\in N^D}q_i a_{k1i},
+  \qquad \forall k\in K.
+\end{equation}
+
+Từ chuyến thứ hai trở đi, tải đầu chuyến gồm hàng pickup C2 còn trên truck từ chuyến
+trước cộng với hàng C1 mới được chất ở depot:
+\begin{equation}
+  L_{km0}=L^{end}_{k,m-1}+\sum_{i\in N^D}q_i a_{kmi},
+  \qquad \forall k\in K,\ m=2,\ldots,H_{\max}.
+\end{equation}
+
+\begin{equation}
+  L_{km0}\le Q_Tg_{km},
+  \qquad \forall k\in K,\ m\in H.
+\end{equation}
+
+Tải truck sau khi hoàn tất phục vụ và bàn giao tại vị trí \(p\):
+\begin{equation}
+  L_{kmp}
+  =
+  L_{km,p-1}
+  +\sum_{i\in N^P}q_i y_{kmpi}
+  -\sum_{i\in N^{DL}}q_i y_{kmpi}
+  -\sum_{i\in N^D}q_i y_{kmpi}
+  +\sum_{i\in N^D}q_i b_{kmpi},
+\end{equation}
+\[
+  \forall k\in K,\ m\in H,\ p\in P.
+\]
+
+\begin{equation}
+  0\le L_{kmp}\le Q_Tu_{kmp},
+  \qquad \forall k\in K,\ m\in H,\ p\in P.
+\end{equation}
+
+Tải cuối chuyến bằng tải tại khách cuối cùng của chuyến:
+\begin{equation}
+  L^{end}_{km}\ge L_{kmp}-M(1-\lambda_{kmpi}),
+  \qquad \forall k\in K,\ m\in H,\ p\in P,\ i\in N.
+\end{equation}
+\begin{equation}
+  L^{end}_{km}\le L_{kmp}+M(1-\lambda_{kmpi}),
+  \qquad \forall k\in K,\ m\in H,\ p\in P,\ i\in N.
+\end{equation}
+\begin{equation}
+  0\le L^{end}_{km}\le Q_Tg_{km},
+  \qquad \forall k\in K,\ m\in H.
+\end{equation}
+
+Để cấm tường minh hàng C1 đi qua depot nhưng vẫn cho phép hàng C2 đi qua depot, tải
+cuối chuyến phải bằng đúng cân bằng pickup--delivery C2 lũy kế:
+\begin{equation}
+  L^{end}_{km}
+  =
+  \sum_{(p',\ell)\in\mathcal A}q_{p'}
+  \left(
+    \sum_{r=1}^{m}\sum_{s\in P}y_{krs p'}
+    -
+    \sum_{r=1}^{m}\sum_{s\in P}y_{krs\ell}
+  \right),
+  \qquad \forall k\in K,\ m\in H.
+\end{equation}
+Vì pickup và delivery cùng truck và pickup đứng trước delivery, vế phải không âm.
+Nếu \(L^{end}_{km}>0\), toàn bộ phần tải đó là hàng C2 đã pickup nhưng chưa tới
+delivery tương ứng. Do đó C2 có thể được giữ qua depot, còn C1 thì không.
+
+\subsection{Thời gian truck}
+
+\begin{equation}
+  y_{km1i}=1\ \Longrightarrow\
+  A_{km1}=T^0_{km}+t^T_{0i},
+  \qquad \forall k\in K,\ m\in H,\ i\in N.
+\end{equation}
+
+\begin{equation}
+  z_{kmpij}=1\ \Longrightarrow\
+  A_{km,p+1}=D_{kmp}+t^T_{ij},
+\end{equation}
+\[
+  \forall k\in K,\ m\in H,\ p=1,\ldots,P_{\max}-1,\ i,j\in N.
+\]
+
+\begin{equation}
+  D_{kmp}\ge A_{kmp}+s_Tu_{kmp}+\delta_m\rho_{kmp},
+  \qquad \forall k\in K,\ m\in H,\ p\in P.
+\end{equation}
+Khi không có drone resupply tại vị trí đang dùng, thời điểm rời được khóa đúng bằng
+thời điểm đến cộng service time:
+\begin{equation}
+  D_{kmp}\le A_{kmp}+s_T+M\rho_{kmp}+M(1-u_{kmp}),
+  \qquad \forall k\in K,\ m\in H,\ p\in P.
+\end{equation}
+\begin{equation}
+  D_{kmp}\ge F^{arr}_{ds}+\delta_m
+  -M\left(1-\sum_{j\in N}w_{dskmpj}\right),
+\end{equation}
+\[
+  \forall d\in R,\ s\in S,\ k\in K,\ m\in H,\ p\in P.
+\]
+
+Thứ tự service--handover phụ thuộc vào nguồn của kiện giao tại node hẹn $j$.
+Nếu truck đã có sẵn kiện để phục vụ $j$, service phải hoàn tất trước khi drone tới:
+\begin{equation}
+ F^{arr}_{ds}\ge A_{kmp}+s_T
+ -M\left(1-w_{dskmpj}+o_{kmpj}\right),
+\end{equation}
+\[
+ \forall d\in R,\ s\in S,\ k\in K,\ m\in H,\ p\in P,\ j\in N^D.
+\]
+Nếu chính kiện $j$ được drone mang tới, truck nhận hàng trước rồi mới service:
+\begin{equation}
+ D_{kmp}\ge F^{arr}_{ds}+\delta_m+s_T
+ -M\left(2-w_{dskmpj}-o_{kmpj}\right),
+\end{equation}
+\[
+ \forall d\in R,\ s\in S,\ k\in K,\ m\in H,\ p\in P,\ j\in N^D.
+\]
+Đối với node pickup/delivery C2, drone không mang kiện C2 nên luôn thuộc trường hợp
+service trước handover.
+\begin{equation}
+ F^{arr}_{ds}\ge A_{kmp}+s_T-M(1-w_{dskmpj}),
+ \quad j\in N^P\cup N^L.
+\end{equation}
+
+\begin{equation}
+  \lambda_{kmpi}=1\ \Longrightarrow\
+  B_{km}=D_{kmp}+t^T_{i0},
+  \qquad \forall k\in K,\ m\in H,\ p\in P,\ i\in N.
+\end{equation}
+
+Chuyến đầu tiên không cộng thời gian bốc dỡ truck tại depot:
+\begin{equation}
+  T^0_{k1}\ge r_i a_{k1i},
+  \qquad \forall k\in K,\ i\in N^D.
+\end{equation}
+
+Từ chuyến thứ hai, truck chỉ rời depot sau khi chuyến trước kết thúc và đã bốc dỡ:
+\begin{equation}
+  T^0_{km}\ge B_{k,m-1}+\delta_T-M(1-g_{km}),
+  \qquad \forall k\in K,\ m=2,\ldots,H_{\max}.
+\end{equation}
+
+Release date cho hàng C1 chất lên truck tại depot đầu chuyến:
+\begin{equation}
+  T^0_{km}\ge r_i a_{kmi},
+  \qquad \forall k\in K,\ m\in H,\ i\in N^D.
+\end{equation}
+
+\subsection{Release date, drone và đồng bộ}
+
+\begin{equation}
+  F^{dep}_{ds}\ge r_i+\delta_d
+  -M\left(1-b_{kmpi}\right)
+  -M\left(1-\sum_{j\in N}w_{dskmpj}\right),
+\end{equation}
+\[
+  \forall d\in R,\ s\in S,\ k\in K,\ m\in H,\ p\in P,\ i\in N^D.
+\]
+
+\begin{equation}
+  F^{dep}_{d,s+1}\ge F^{ret}_{ds}+\delta_d-M(1-\eta_{d,s+1}),
+  \qquad \forall d\in R,\ s=1,\ldots,S_{\max}-1.
+\end{equation}
+
+\begin{equation}
+  w_{dskmpj}=1\ \Longrightarrow\
+  F^{arr}_{ds}=F^{dep}_{ds}+t^D_{0j},
+\end{equation}
+\[
+  \forall d\in R,\ s\in S,\ k\in K,\ m\in H,\ p\in P,\ j\in N.
+\]
+
+\begin{equation}
+  w_{dskmpj}=1\ \Longrightarrow\
+  F^{ret}_{ds}=F^{arr}_{ds}+\delta_m+t^D_{j0},
+\end{equation}
+\[
+  \forall d\in R,\ s\in S,\ k\in K,\ m\in H,\ p\in P,\ j\in N.
+\]
+
+Drone không cần chờ truck tại điểm hẹn. Vì vậy nếu chuyến bay \((d,s)\) được gán
+cho điểm hẹn \((k,m,p)\), thời điểm drone tới điểm hẹn không được sớm hơn thời điểm
+truck tới vị trí đó:
+\begin{equation}
+  F^{arr}_{ds}\ge A_{kmp}-M\left(1-\sum_{j\in N}w_{dskmpj}\right),
+\end{equation}
+\[
+  \forall d\in R,\ s\in S,\ k\in K,\ m\in H,\ p\in P.
+\]
+
+Truck có thể chờ drone tại điểm hẹn, nên mô hình không dùng tham số giới hạn thời
+gian chờ. Để giảm thời gian chờ không cần thiết, nghiệm tối ưu sẽ chọn
+\(F^{dep}_{ds}\) phù hợp với release date, thứ tự chuyến bay của drone, và thời điểm
+truck tới điểm hẹn; với một lịch cố định, có thể hậu xử lý bằng cách đẩy
+\(F^{dep}_{ds}\) muộn nhất có thể mà không làm tăng \(C_{\max}\).
+
+\begin{equation}
+  F^{ret}_{ds}-F^{dep}_{ds}\le E+M(1-\eta_{ds}),
+  \qquad \forall d\in R,\ s\in S.
+\end{equation}
+
+\subsection{Cmax}
+
+\begin{equation}
+  C_{\max}\ge B_{km},
+  \qquad \forall k\in K,\ m\in H.
+\end{equation}
+
+\begin{equation}
+  C_{\max}\ge F^{ret}_{ds},
+  \qquad \forall d\in R,\ s\in S.
+\end{equation}
+
+\subsection{Miền giá trị}
+
+\begin{align*}
+y_{kmpi},u_{kmp},g_{km},z_{kmpij},\lambda_{kmpi},
+a_{kmi},b_{kmpi},o_{kmpi},\rho_{kmp},w_{dskmpj},\eta_{ds}
+&\in\{0,1\},\\
+T^0_{km},A_{kmp},D_{kmp},B_{km},
+F^{dep}_{ds},F^{arr}_{ds},F^{ret}_{ds},L_{kmp},L^{end}_{km},C_{\max}
+&\ge0.
+\end{align*}
+
+\section{Ghi chú triển khai}
+
+Mô hình trên và file \texttt{milp.py} cùng sử dụng truck nhiều chuyến, truck và drone
+có capacity, C1 phải được nhận và giao trong cùng chuyến truck, hàng pickup C2 có thể
+được giữ qua depot để giao ở chuyến sau, và mỗi chuyến drone chỉ có một rendezvous.
+Khi CPLEX dừng ở time limit, incumbent có thể chứa slack trong các biến thời gian dù
+quyết định route/load/resupply đã cố định. Vì vậy code cố định toàn bộ biến nhị phân
+của incumbent và giải lại bài toán thời gian liên tục trước khi báo objective hoặc so
+sánh với decoder heuristic.
+
+Khi kiểm tra fitness của một nghiệm heuristic, file encoding lưu thêm drone ID, thứ
+tự sortie và các mốc depart/arrive/return. Tất cả quyết định route, depot load,
+resupply và gán drone được cố định; phần MILP còn lại chỉ tối ưu các biến thời gian.
+Với instance lớn, cùng hệ ràng buộc thời gian được dựng trực tiếp trên các arc và
+sortie thực sự xuất hiện trong nghiệm, tránh tạo biến cho các arc không được chọn.
+Cách kiểm tra này đã cho cùng $C_{\max}$ trên toàn bộ các bộ 10, 15 và 50 khách
+hàng đã thử nghiệm.
+
+\end{document}

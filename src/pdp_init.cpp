@@ -53,6 +53,10 @@ static bool customerNeedsPackage(const PDPData& data, int j) {
     return true;  // Type "D" or unknown
 }
 
+static bool isDirectDelivery(const PDPData& data, int j) {
+    return j > 0 && j < (int)data.nodeTypes.size() && data.nodeTypes[j] == "D";
+}
+
 // ============================================================
 // Drone Schedule tracking during init construction
 // (Shared across all trucks in one individual)
@@ -118,6 +122,7 @@ static vector<int> selectDepotLoad(
     // Phase 1: Load all currently-ready packages (original behavior)
     for (int h = pos; h < (int)customers.size(); ++h) {
         int i = customers[h];
+        if (!isDirectDelivery(data, i)) continue;
         if (onboard.count(i)) continue;
         if (pkgRelease(data, i) > current_time + 1e-9) continue;
 
@@ -149,9 +154,7 @@ static vector<int> selectDepotLoad(
             if (ri <= current_time + 1e-9) continue;  // already handled in Phase 1
 
             // Only type "D" packages need depot/drone supply
-            if (i > 0 && i < (int)data.nodeTypes.size()) {
-                if (data.nodeTypes[i] != "D") continue;
-            }
+            if (!isDirectDelivery(data, i)) continue;
 
             double w = pkgWeight(data, i);
             if (w > remaining + 1e-9) continue;
@@ -394,15 +397,16 @@ static Route buildRouteWithResupply(
             double costRet = findDepotReturnCost(j, cur, t, data);
 
             // Select (Algorithm 14)
-            if (selectDroneOverDepot(optD, costRet, gen)) {
+            bool canAttachDroneHere = (!enc.empty() && enc.back().node == cur &&
+                                       enc.back().packages.empty());
+
+            if (canAttachDroneHere && selectDroneOverDepot(optD, costRet, gen)) {
 
                 // ========= DRONE RESUPPLY =========
                 // Attach packages to the bracket of current node
                 // (which is the last stop in enc)
-                if (!enc.empty() && enc.back().node == cur) {
-                    for (int p : optD.packages)
-                        enc.back().packages.push_back(p);
-                }
+                for (int p : optD.packages)
+                    enc.back().packages.push_back(p);
 
                 for (int p : optD.packages) {
                     onboard.insert(p);
@@ -487,7 +491,7 @@ static Route buildRouteWithResupply(
             DroneResupplyOption optF = findDroneResupplySet(
                 customers, pos + 1, cur, t, onboard, data, droneSchedule);
 
-            if (optF.feasible && !optF.packages.empty()) {
+            if (optF.feasible && !optF.packages.empty() && enc.back().packages.empty()) {
                 // Add future packages to bracket of node j
                 for (int p : optF.packages)
                     enc.back().packages.push_back(p);
@@ -511,6 +515,45 @@ static Route buildRouteWithResupply(
     return enc;
 }
 
+static void repairC2CustomerRoutes(vector<vector<int>>& routes, const PDPData& data) {
+    auto findNode = [&](int node) {
+        for (int r = 0; r < (int)routes.size(); ++r) {
+            for (int p = 0; p < (int)routes[r].size(); ++p) {
+                if (routes[r][p] == node) return pair<int,int>{r, p};
+            }
+        }
+        return pair<int,int>{-1, -1};
+    };
+
+    for (int pickup = 1; pickup < data.numNodes; ++pickup) {
+        if (pickup >= (int)data.nodeTypes.size() || data.nodeTypes[pickup] != "P") {
+            continue;
+        }
+
+        int delivery = -1;
+        for (int node = 1; node < data.numNodes; ++node) {
+            if (node != pickup &&
+                node < (int)data.nodeTypes.size() &&
+                data.nodeTypes[node] == "DL" &&
+                data.pairIds[node] == data.pairIds[pickup]) {
+                delivery = node;
+                break;
+            }
+        }
+        if (delivery < 0) continue;
+
+        auto [pRoute, pPos] = findNode(pickup);
+        auto [dRoute, dPos] = findNode(delivery);
+        if (pRoute < 0 || dRoute < 0) continue;
+
+        routes[dRoute].erase(routes[dRoute].begin() + dPos);
+
+        auto [newPRoute, newPPos] = findNode(pickup);
+        if (newPRoute < 0) continue;
+        routes[newPRoute].insert(routes[newPRoute].begin() + newPPos + 1, delivery);
+    }
+}
+
 // ============================================================
 // Build one individual (complete solution encoding)
 // ============================================================
@@ -527,18 +570,21 @@ static SolutionEncoding buildIndividual(const PDPData& data, mt19937& gen) {
     const int base = N / nTrucks;
     const int rem  = N % nTrucks;
 
-    // Shared drone schedule: drones are shared across all trucks
-    DroneScheduleInit droneSchedule(max(1, data.numDrones));
-
+    vector<vector<int>> customerRoutes(nTrucks);
     int offset = 0;
     for (int k = 0; k < nTrucks; ++k) {
         const int len = base + (k < rem ? 1 : 0);
 
-        vector<int> truckCusts(customers.begin() + offset,
-                               customers.begin() + offset + len);
+        customerRoutes[k].assign(customers.begin() + offset,
+                                 customers.begin() + offset + len);
         offset += len;
+    }
+    repairC2CustomerRoutes(customerRoutes, data);
 
-        sol[k] = buildRouteWithResupply(truckCusts, k, data, droneSchedule, gen);
+    // Shared drone schedule: drones are shared across all trucks
+    DroneScheduleInit droneSchedule(max(1, data.numDrones));
+    for (int k = 0; k < nTrucks; ++k) {
+        sol[k] = buildRouteWithResupply(customerRoutes[k], k, data, droneSchedule, gen);
     }
 
     return sol;

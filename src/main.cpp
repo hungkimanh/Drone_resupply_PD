@@ -7,14 +7,19 @@
  * Layer 2: CP-SAT LSP evaluates each candidate routing (loading)
  *
  * Usage: ./pdp_solver <instance_file> [options]
- *   --depot 0|1|2   depot mode (0=center default)
+ *   --depot 0|1|2   depot mode (1=border default for bundled instances)
  *   --iter N        TS max iterations (default 1000)
  *   --lsp T         CP-SAT time limit per call in seconds (default 3.0)
  *   --run K         run number / random seed
  *   --time T        total time limit in seconds
+ *   --truck-cap Q   override truck capacity for experiments
+ *   --drones D      override the number of available drones
+ *   --check-diverse  evaluate the built-in U_10 multi-trip test fixture
  */
 
 #include <chrono>
+#include <algorithm>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -31,6 +36,76 @@
 
 using namespace std;
 
+static void writeEncodingFile(const string& path, const PDPSolution& sol) {
+    SolutionEncoding encoded = sol.encoded_routes;
+    vector<int> sortie(sol.resupply_events.size(), 0);
+    for (int d = 0; d < (int)sol.drone_completion_times.size(); ++d) {
+        vector<int> ids;
+        for (int e = 0; e < (int)sol.resupply_events.size(); ++e)
+            if (sol.resupply_events[e].drone_id == d) ids.push_back(e);
+        sort(ids.begin(), ids.end(), [&](int a, int b) {
+            return sol.resupply_events[a].drone_depart_time < sol.resupply_events[b].drone_depart_time;
+        });
+        for (int r = 0; r < (int)ids.size(); ++r) sortie[ids[r]] = r + 1;
+    }
+    for (int e = 0; e < (int)sol.resupply_events.size(); ++e) {
+        const auto& ev = sol.resupply_events[e];
+        for (auto& st : encoded[ev.truck_id]) {
+            if (st.node == ev.resupply_point && st.packages == ev.customer_ids &&
+                st.fixed_drone_id < 0) {
+                st.fixed_drone_id = ev.drone_id;
+                st.fixed_drone_trip = sortie[e];
+                st.fixed_drone_depart = ev.drone_depart_time;
+                st.fixed_drone_arrive = ev.drone_arrive_time;
+                st.fixed_drone_return = ev.drone_return_time;
+                break;
+            }
+        }
+    }
+
+    ofstream out(path);
+    out << fixed << setprecision(12) << "HEURISTIC_CMAX " << sol.totalCost << "\n";
+    for (int k = 0; k < (int)encoded.size(); ++k) {
+        out << "ROUTE " << k << "\n";
+        for (const auto& st : encoded[k]) {
+            out << "STOP " << st.node;
+            for (int pkg : st.packages) out << " " << pkg;
+            if (st.fixed_drone_id >= 0) {
+                out << " DRONE " << st.fixed_drone_id << " " << st.fixed_drone_trip
+                    << " " << st.fixed_drone_depart << " " << st.fixed_drone_arrive
+                    << " " << st.fixed_drone_return;
+            }
+            out << "\n";
+        }
+        out << "END_ROUTE\n";
+    }
+}
+
+static SolutionEncoding diverseU10Fixture() {
+    return {
+        {
+            RouteStop(0),
+            RouteStop(4, {3}),
+            RouteStop(3),
+            RouteStop(0, {5, 1}),
+            RouteStop(10),
+            RouteStop(5),
+            RouteStop(1, {2}),
+            RouteStop(2),
+            RouteStop(0),
+        },
+        {
+            RouteStop(0, {9}),
+            RouteStop(9),
+            RouteStop(0, {6}),
+            RouteStop(6),
+            RouteStop(7, {7, 8}),
+            RouteStop(8),
+            RouteStop(0),
+        },
+    };
+}
+
 int main(int argc, char* argv[]) {
     auto t_start = chrono::high_resolution_clock::now();
 
@@ -41,26 +116,43 @@ int main(int argc, char* argv[]) {
     }
 
     const string instanceFile = argv[1];
-    int depotMode    = 0;
+    int depotMode    = 1;
     int maxIter      = 1000;
     double lspCutoff = 3.0;
     int runNumber    = 1;
     double timeLimit = -1.0;
+    int truckCapacityOverride = -1;
+    int numDronesOverride = -1;
+    string encodingOutput;
+    bool checkDiverse = false;
 
     for (int i = 2; i < argc; ++i) {
         string arg = argv[i];
+        if (arg == "--check-diverse") {
+            checkDiverse = true;
+            continue;
+        }
         if ((arg == "--depot" || arg == "--iter" || arg == "--lsp" ||
-             arg == "--run"   || arg == "--time") && i + 1 < argc) {
+             arg == "--run"   || arg == "--time" || arg == "--truck-cap" ||
+             arg == "--drones" || arg == "--encoding-output") && i + 1 < argc) {
             istringstream ss(argv[++i]);
             if      (arg == "--depot") ss >> depotMode;
             else if (arg == "--iter")  ss >> maxIter;
             else if (arg == "--lsp")   ss >> lspCutoff;
             else if (arg == "--run")   ss >> runNumber;
             else if (arg == "--time")  ss >> timeLimit;
+            else if (arg == "--truck-cap") ss >> truckCapacityOverride;
+            else if (arg == "--drones") ss >> numDronesOverride;
+            else if (arg == "--encoding-output") encodingOutput = argv[i];
         } else {
             cerr << "Unknown argument: " << arg << "\n";
             return 1;
         }
+    }
+
+    if (depotMode < 0 || depotMode > 2) {
+        cerr << "Invalid --depot value: " << depotMode << " (expected 0, 1, or 2)\n";
+        return 1;
     }
 
     // ---- Load instance ----
@@ -70,7 +162,24 @@ int main(int argc, char* argv[]) {
         cerr << "Error: cannot read " << instanceFile << "\n";
         return 1;
     }
+    if (truckCapacityOverride > 0) data.truckCapacity = truckCapacityOverride;
+    if (numDronesOverride >= 0) data.numDrones = numDronesOverride;
     showPDPInfo(data);
+
+    if (checkDiverse) {
+        if (data.numNodes != 11) {
+            cerr << "--check-diverse requires the bundled 10-customer instance\n";
+            return 1;
+        }
+        SolutionEncoding fixture = diverseU10Fixture();
+        PDPSolution checked = decode_solution(fixture, data, false);
+        printEncodedSolution(fixture);
+        print_decoded_routes(checked, data);
+        bool valid = validateSolution(checked, data, true);
+        cout << "DIVERSE_FIXTURE_OBJECTIVE=" << fixed << setprecision(6)
+             << checked.totalCost << "\n";
+        return valid ? 0 : 2;
+    }
 
     bool isSmall = (data.numCustomers + 1 <= 20);
     if (timeLimit < 0) timeLimit = isSmall ? 150.0 : 3600.0;
@@ -144,13 +253,24 @@ int main(int argc, char* argv[]) {
     cout << "\n+========================================================+\n"
          << "|               TS-ALNS-LSP RESULT                      |\n"
          << "+========================================================+\n"
-         << "C_max (TS+LSP) : " << fixed << setprecision(2) << ts.best_obj << " min\n"
          << "TS iterations  : " << ts.iterations_done << "\n";
 
     if (ts.best_lsp.feasible && !ts.best_lsp.encoding.empty()) {
         PDPSolution final_sol = decode_solution(ts.best_lsp.encoding, data, false);
+        bool valid = validateSolution(final_sol, data, /*verbose=*/true);
+        double final_obj = valid ? final_sol.totalCost : numeric_limits<double>::infinity();
+
+        cout << "C_max (verified): " << fixed << setprecision(2) << final_obj << " min\n";
         cout << "Feasible       : " << (final_sol.isFeasible ? "YES" : "NO") << "\n";
         cout << "Penalty        : " << final_sol.totalPenalty << "\n";
+
+        if (!valid) {
+            cout << "No verified feasible solution found.\n";
+            double elapsed = chrono::duration<double>(
+                chrono::high_resolution_clock::now() - t_start).count();
+            cout << "\n[RUNTIME] " << fixed << setprecision(2) << elapsed << " s\n";
+            return 2;
+        }
 
         cout << "\n[ENCODING]\n";
         printEncodedSolution(ts.best_lsp.encoding);
@@ -158,8 +278,8 @@ int main(int argc, char* argv[]) {
         cout << "\n[SOLUTION DETAIL]\n";
         print_decoded_routes(final_sol, data);
         printSolution(final_sol, data);
-        validateSolution(final_sol, data, /*verbose=*/true);
-        printSolutionSummary(final_sol, best_init_cost, ts.best_obj);
+        printSolutionSummary(final_sol, best_init_cost, final_obj);
+        if (!encodingOutput.empty()) writeEncodingFile(encodingOutput, final_sol);
     } else {
         cout << "No feasible solution found.\n";
     }

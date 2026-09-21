@@ -1,0 +1,386 @@
+    Mô hình MILP cho bài toán Truck–Drone Resupply
+                         PDP
+       Mô hình một điểm hẹn cho mỗi chuyến drone, xe tải nhiều chuyến
+
+
+1     Mô tả bài toán
+Bài toán xét một đội xe tải và drone xuất phát từ depot 0 để phục vụ tập khách hàng N . Mỗi
+khách hàng được xe tải ghé đúng một lần. Với khách hàng giao hàng trực tiếp i ∈ N D , kiện
+hàng của i có thể được chất lên xe tải tại depot đầu một chuyến truck, hoặc được drone mang
+từ depot tới một điểm hẹn trên hành trình truck. Kiện C1 phải được giao trước khi truck quay
+lại depot kết thúc chuyến đã nhận kiện đó. Với cặp pickup–delivery (p, ℓ) ∈ A, pickup p và
+delivery ℓ phải nằm trên cùng một truck, và delivery phải nằm sau pickup trong toàn hành trình
+của truck đó.
+    Mỗi truck có thể đi nhiều chuyến. Mỗi chuyến truck có dạng
+                                           0 → · · · → 0.
+Khi truck quay lại depot để bắt đầu chuyến tiếp theo, truck không bắt buộc phải rỗng: hàng đã
+pickup ở một khách hàng có thể được giữ trên truck để giao cho delivery tương ứng ở chuyến
+sau, miễn là capacity truck luôn được tôn trọng. Lần xuất phát đầu tiên từ depot không tính thời
+gian bốc dỡ truck; từ chuyến thứ hai trở đi có tính thời gian bốc dỡ tại depot. Lần cuối truck
+quay về depot để kết thúc hành trình không tính thêm thời gian bốc dỡ.
+    Mỗi chuyến drone chỉ có một điểm hẹn với một truck tại một khách hàng. Drone xuất phát
+từ depot, bay tới điểm hẹn, bàn giao hàng cho truck, rồi quay về depot:
+                                            0 → h → 0.
+Mô hình này không dùng multi-rendezvous cho drone.
+
+Khoảng cách và vận tốc. Truck dùng khoảng cách Manhattan, vận tốc 30 km/h. Drone dùng
+khoảng cách Euclidean, vận tốc 60 km/h. Thời gian di chuyển tính theo phút:
+                                                   √
+               |xi − xj | + |yi − yj |                (xi − xj )2 + (yi − yj )2
+          T
+         tij =                         · 60,  D
+                                             tij =                              · 60.
+                         30                                     60
+
+2     Tập chỉ số và tham số
+3     Biến quyết định
+3.1   Route truck
+                      {
+                          1,   nếu truck k phục vụ khách i ở vị trí p trong chuyến m,
+            ykmpi =
+                          0,   ngược lại,
+
+                                                  1
+           Ký hiệu                     Ý nghĩa
+           0                           depot
+           N                           tập khách hàng
+           ND                          tập khách hàng giao hàng trực tiếp, loại D
+           NP                          tập node pickup, loại P
+           N DL                        tập node delivery của pickup–delivery, loại DL
+           A                           tập cặp pickup–delivery (p, ℓ)
+           K                           tập truck
+           R                           tập drone
+           H = {1, . . . , Hmax }      tập chuyến tiềm năng của mỗi truck
+           P = {1, . . . , Pmax }      tập vị trí tiềm năng trong một chuyến truck
+           S = {1, . . . , Smax }      tập chuyến bay tiềm năng của mỗi drone
+
+        Ký hiệu       Ý nghĩa
+        qi            khối lượng kiện hàng của khách i
+        ri            release date của kiện hàng i
+        QT            tải trọng truck
+        QD            tải trọng drone
+        sT            thời gian truck phục vụ một khách hàng
+        δm            thời gian bàn giao drone–truck tại điểm hẹn
+        δd            thời gian drone chất hàng tại depot trước mỗi chuyến bay
+        δT            thời gian truck bốc dỡ tại depot trước chuyến truck thứ hai trở đi
+        E             endurance tối đa của một chuyến bay drone
+        M             hằng số Big-M đủ lớn
+        tTij          thời gian truck đi từ i đến j
+        tDij          thời gian drone bay từ i đến j
+
+                           {
+                               1, nếu vị trí p của chuyến m của truck k được dùng,
+               ukmp =
+                               0, ngược lại,
+                                 {
+                                   1, nếu chuyến m của truck k được dùng,
+                       gkm     =
+                                   0, ngược lại.
+                      {
+                    1, nếu trong chuyến m của truck k, i ở vị trí p và j ở p + 1,
+         zkmpij =
+                    0, ngược lại,
+                   {
+                     1, nếu i là khách cuối của chuyến m của truck k tại vị trí p,
+         λkmpi   =
+                     0, ngược lại.
+
+
+3.2   Nguồn hàng và drone
+                  {
+                      1,   nếu kiện C1 i được chất lên truck k tại depot đầu chuyến m,
+        akmi =
+                      0,   ngược lại,
+
+
+
+                                                  2
+                {
+               1, nếu kiện C1 i được drone giao cho truck k tại vị trí p của chuyến m,
+      bkmpi =
+               0, ngược lại,
+               {
+                 1, nếu có một chuyến drone hẹn truck k tại vị trí p của chuyến m,
+        ρkmp =
+                 0, ngược lại.
+                  
+                  
+                  1, nếu chuyến bay s của drone d gặp truck k trong chuyến m,
+        wdskmpj =       tại vị trí p, node j,
+                  
+                  
+                    0, ngược lại,
+                        {
+                          1, nếu chuyến bay s của drone d được dùng,
+                  ηds =
+                          0, ngược lại.
+
+3.3   Thời gian và tải
+                          0
+                         Tkm ≥ 0,      Akmp ≥ 0,          Dkmp ≥ 0,   Bkm ≥ 0,
+            0
+trong đó Tkm    là thời điểm truck k rời depot bắt đầu chuyến m, Akmp , Dkmp là thời điểm truck
+đến/rời vị trí p, và Bkm là thời điểm truck quay về depot kết thúc chuyến m.
+                           dep
+                          Fds  ≥ 0,       arr
+                                         Fds  ≥ 0,         ret
+                                                          Fds  ≥ 0,   Cmax ≥ 0.
+                                         Lkmp ≥ 0,         km ≥ 0
+                                                          Lend
+là tải trên truck k ngay sau khi rời vị trí p trong chuyến m. Ký hiệu Lkm0 là tải truck ngay khi
+rời depot đầu chuyến m, và Lendkm là tải còn trên truck khi chuyến m quay về depot. Tải còn lại
+này chỉ có thể là hàng pickup C2 chưa tới delivery tương ứng.
+
+
+4     Hàm mục tiêu
+                                                  min Cmax .
+
+
+5     Ràng buộc
+5.1   Cấu trúc route truck nhiều chuyến
+                          ∑
+                                ykmpi = ukmp ,        ∀k ∈ K, m ∈ H, p ∈ P.                  (1)
+                          i∈N
+
+                            ukmp ≤ gkm ,           ∀k ∈ K, m ∈ H, p ∈ P.                     (2)
+
+                    ukm,p+1 ≤ ukmp ,       ∀k ∈ K, m ∈ H, p = 1, . . . , Pmax − 1.           (3)
+
+                        gk,m+1 ≤ gkm ,           ∀k ∈ K, m = 1, . . . , Hmax − 1.            (4)
+
+                                  ∑∑∑
+                                                 ykmpi = 1,       ∀i ∈ N.                    (5)
+                                 k∈K m∈H p∈P
+
+
+
+                                                      3
+             zkmpij ≤ ykmpi ,     zkmpij ≤ ykm,p+1,j ,           zkmpij ≥ ykmpi + ykm,p+1,j − 1,       (6)
+                          ∀k ∈ K, m ∈ H, p = 1, . . . , Pmax − 1, i, j ∈ N.
+
+
+      λkmpi ≤ ykmpi ,    λkmpi ≤ ukmp − ukm,p+1 ,               λkmpi ≥ ykmpi + ukmp − ukm,p+1 − 1,    (7)
+
+                           ∀k ∈ K, m ∈ H, p = 1, . . . , Pmax − 1, i ∈ N.
+                        λkm,Pmax ,i = ykm,Pmax ,i ,            ∀k ∈ K, m ∈ H, i ∈ N.                   (8)
+
+5.2     Pickup–delivery
+Pickup và delivery của cùng một cặp phải nằm trên cùng một truck, nhưng có thể nằm ở hai
+chuyến khác nhau:
+                 ∑∑               ∑∑
+                         ykmpp′ =         ykmpℓ ,   ∀k ∈ K, (p′ , ℓ) ∈ A.            (9)
+                   m∈H p∈P                 m∈H p∈P
+
+
+     Pickup phải đứng trước delivery trong toàn hành trình của truck. Thứ tự toàn hành trình của
+vị trí (m, p) được tính bởi (m − 1)Pmax + p:
+                              ∑ ∑(                      )
+                                       (m − 1)Pmax + p ykmpp′ + 1
+                                 m∈H p∈P
+                                     ∑ ∑(                        )
+                                 ≤                (m − 1)Pmax + p ykmpℓ
+                                     m∈H p∈P
+                                                                                                      (10)
+                                           (                              )
+                                                      ∑∑
+                                     +M        1−                ykmpp′       ,
+                                                    m∈H p∈P
+
+
+                                           ∀k ∈ K, (p′ , ℓ) ∈ A.
+
+5.3     Nguồn hàng cho khách C1
+                           ∑               ∑
+                  akmi +         bkmpi =         ykmpi ,         ∀k ∈ K, m ∈ H, i ∈ N D .             (11)
+                           p∈P             p∈P
+
+    Do cả nguồn hàng và lần phục vụ đều mang cùng chỉ số chuyến m, phương trình trên buộc
+mọi kiện C1 được chất tại depot hoặc nhận từ drone phải được giao trong chính chuyến truck
+đó; kiện C1 không thể được mang qua một lần quay về depot.
+                         ∑
+                 bkmpi ≤     ykmqi ,    ∀k ∈ K, m ∈ H, p ∈ P, i ∈ N D .               (12)
+                              q∈P
+                              q≥p
+
+
+                        bkmpi ≤ ρkmp ,           ∀k ∈ K, m ∈ H, p ∈ P, i ∈ N D .                      (13)
+
+                             ρkmp ≤ ukmp ,            ∀k ∈ K, m ∈ H, p ∈ P.                           (14)
+
+
+
+                                                           4
+5.4      Drone capacity và gán chuyến drone
+                       ∑
+                                qi bkmpi ≤ QD ρkmp ,               ∀k ∈ K, m ∈ H, p ∈ P.         (15)
+                      i∈N D
+                    ∑∑∑
+                                        wdskmpj = ρkmp ,              ∀k ∈ K, m ∈ H, p ∈ P.      (16)
+                    d∈R s∈S j∈N
+
+              wdskmpj ≤ ykmpj ,             ∀d ∈ R, s ∈ S, k ∈ K, m ∈ H, p ∈ P, j ∈ N.           (17)
+                        ∑ ∑ ∑∑
+                                                  wdskmpj = ηds ,          ∀d ∈ R, s ∈ S.        (18)
+                        k∈K m∈H p∈P j∈N
+
+                           ηd,s+1 ≤ ηds ,            ∀d ∈ R, s = 1, . . . , Smax − 1.            (19)
+
+5.5      Truck capacity và tải chuyển tiếp giữa các chuyến
+                                                    ∑
+                                        Lk10 =            qi ak1i ,      ∀k ∈ K.                 (20)
+                                                  i∈N D
+
+   Từ chuyến thứ hai trở đi, tải đầu chuyến gồm hàng pickup C2 còn trên truck từ chuyến trước
+cộng với hàng C1 mới được chất ở depot:
+                                   ∑
+              Lkm0 = Lendk,m−1 +        qi akmi ,  ∀k ∈ K, m = 2, . . . , Hmax .          (21)
+                                            i∈N D
+
+
+                                  Lkm0 ≤ QT gkm ,                 ∀k ∈ K, m ∈ H.                 (22)
+      Tải truck sau khi hoàn tất phục vụ và bàn giao tại vị trí p:
+                            ∑               ∑                ∑                ∑
+       Lkmp = Lkm,p−1 +          qi ykmpi −      qi ykmpi −        qi ykmpi +   qi bkmpi ,       (23)
+                                i∈N P               i∈N DL                i∈N D         i∈N D
+
+                                            ∀k ∈ K, m ∈ H, p ∈ P.
+
+                        0 ≤ Lkmp ≤ QT ukmp ,                      ∀k ∈ K, m ∈ H, p ∈ P.          (24)
+      Tải cuối chuyến bằng tải tại khách cuối cùng của chuyến:
+
+                km ≥ Lkmp − M (1 − λkmpi ),
+               Lend                                               ∀k ∈ K, m ∈ H, p ∈ P, i ∈ N.   (25)
+
+                km ≤ Lkmp + M (1 − λkmpi ),
+               Lend                                               ∀k ∈ K, m ∈ H, p ∈ P, i ∈ N.   (26)
+                                     km ≤ QT gkm ,
+                                0 ≤ Lend                              ∀k ∈ K, m ∈ H.             (27)
+   Để cấm tường minh hàng C1 đi qua depot nhưng vẫn cho phép hàng C2 đi qua depot, tải
+cuối chuyến phải bằng đúng cân bằng pickup–delivery C2 lũy kế:
+                            ( m                         )
+                  ∑          ∑∑             m ∑
+                                            ∑
+         Lend
+          km =         qp ′        ykrsp′ −        ykrsℓ ,     ∀k ∈ K, m ∈ H.    (28)
+                    (p′ ,ℓ)∈A           r=1 s∈P              r=1 s∈P
+
+
+Vì pickup và delivery cùng truck và pickup đứng trước delivery, vế phải không âm. Nếu Lend
+                                                                                       km >
+0, toàn bộ phần tải đó là hàng C2 đã pickup nhưng chưa tới delivery tương ứng. Do đó C2 có
+thể được giữ qua depot, còn C1 thì không.
+
+                                                              5
+5.6     Thời gian truck
+                                     0
+                ykm1i = 1 =⇒ Akm1 = Tkm + tT0i ,            ∀k ∈ K, m ∈ H, i ∈ N.             (29)
+
+                              zkmpij = 1 =⇒ Akm,p+1 = Dkmp + tTij ,                           (30)
+                          ∀k ∈ K, m ∈ H, p = 1, . . . , Pmax − 1, i, j ∈ N.
+
+                     Dkmp ≥ Akmp + sT ukmp ,            ∀k ∈ K, m ∈ H, p ∈ P.                 (31)
+Khi không có drone resupply tại vị trí đang dùng, thời điểm rời được khóa đúng bằng thời điểm
+đến cộng service time:
+
+        Dkmp ≤ Akmp + sT + M ρkmp + M (1 − ukmp ),           ∀k ∈ K, m ∈ H, p ∈ P.            (32)
+                                             (                       )
+                                                            ∑
+                           Dkmp ≥ Fds
+                                   arr
+                                       + δm − M          1−   wdskmpj ,                       (33)
+                                                             j∈N
+
+                              ∀d ∈ R, s ∈ S, k ∈ K, m ∈ H, p ∈ P.
+
+            λkmpi = 1 =⇒ Bkm = Dkmp + tTi0 ,             ∀k ∈ K, m ∈ H, p ∈ P, i ∈ N.         (34)
+      Chuyến đầu tiên không cộng thời gian bốc dỡ truck tại depot:
+                                 0
+                                Tk1 ≥ ri ak1i ,      ∀k ∈ K, i ∈ N D .                        (35)
+
+      Từ chuyến thứ hai, truck chỉ rời depot sau khi chuyến trước kết thúc và đã bốc dỡ:
+               0
+              Tkm ≥ Bk,m−1 + δT − M (1 − gkm ),            ∀k ∈ K, m = 2, . . . , Hmax .      (36)
+
+      Release date cho hàng C1 chất lên truck tại depot đầu chuyến:
+                            0
+                           Tkm ≥ ri akmi ,        ∀k ∈ K, m ∈ H, i ∈ N D .                    (37)
+
+5.7     Release date, drone và đồng bộ
+                                                             (                        )
+                                                                      ∑
+                    dep
+                   Fds    ≥ ri + δd − M (1 − bkmpi ) − M         1−         wdskmpj       ,   (38)
+                                                                      j∈N
+
+                          ∀d ∈ R, s ∈ S, k ∈ K, m ∈ H, p ∈ P, i ∈ N D .
+
+              dep
+             Fd,s+1 ≥ Fds
+                       ret
+                           + δd − M (1 − ηd,s+1 ),         ∀d ∈ R, s = 1, . . . , Smax − 1.   (39)
+
+                                arr
+                               Fds  ≥ Fds
+                                       dep
+                                              0j − M (1 − wdskmpj ),
+                                           + tD                                               (40)
+                          ∀d ∈ R, s ∈ S, k ∈ K, m ∈ H, p ∈ P, j ∈ N.
+
+                             ret
+                            Fds  ≥ Fds
+                                    arr
+                                                j0 − M (1 − wdskmpj ),
+                                        + δm + tD                                             (41)
+                          ∀d ∈ R, s ∈ S, k ∈ K, m ∈ H, p ∈ P, j ∈ N.
+
+                                                    6
+   Drone không cần chờ truck tại điểm hẹn. Vì vậy nếu chuyến bay (d, s) được gán cho điểm
+hẹn (k, m, p), thời điểm drone tới điểm hẹn không được sớm hơn thời điểm truck tới vị trí đó:
+                                              (               )
+                                                   ∑
+                             arr
+                           Fds   ≥ Akmp − M 1 −        wdskmpj ,                          (42)
+                                                           j∈N
+
+
+                             ∀d ∈ R, s ∈ S, k ∈ K, m ∈ H, p ∈ P.
+    Truck có thể chờ drone tại điểm hẹn, nên mô hình không dùng tham số giới hạn thời gian
+                                                                        dep
+chờ. Để giảm thời gian chờ không cần thiết, nghiệm tối ưu sẽ chọn Fds       phù hợp với release
+date, thứ tự chuyến bay của drone, và thời điểm truck tới điểm hẹn; với một lịch cố định, có thể
+                           dep
+hậu xử lý bằng cách đẩy Fds    muộn nhất có thể mà không làm tăng Cmax .
+
+                      ret
+                     Fds  − Fds
+                             dep
+                                 ≤ E + M (1 − ηds ),              ∀d ∈ R, s ∈ S.                  (43)
+
+5.8   Cmax
+                                Cmax ≥ Bkm ,          ∀k ∈ K, m ∈ H.                              (44)
+
+                                 Cmax ≥ Fds
+                                         ret
+                                             ,          ∀d ∈ R, s ∈ S.                            (45)
+
+5.9   Miền giá trị
+
+            ykmpi , ukmp , gkm , zkmpij , λkmpi , akmi , bkmpi , ρkmp , wdskmpj , ηds ∈ {0, 1},
+                                                                      km , Cmax ≥ 0.
+                0                         dep    arr    ret
+               Tkm , Akmp , Dkmp , Bkm , Fds  , Fds  , Fds  , Lkmp , Lend
+
+
+6     Ghi chú triển khai
+Mô hình trên và file milp.py cùng sử dụng truck nhiều chuyến, truck và drone có capacity, C1
+phải được nhận và giao trong cùng chuyến truck, hàng pickup C2 có thể được giữ qua depot để
+giao ở chuyến sau, và mỗi chuyến drone chỉ có một rendezvous. Khi CPLEX dừng ở time limit,
+incumbent có thể chứa slack trong các biến thời gian dù quyết định route/load/resupply đã cố
+định. Vì vậy code cố định toàn bộ biến nhị phân của incumbent và giải lại bài toán thời gian
+liên tục trước khi báo objective hoặc so sánh với decoder heuristic.
+
+
+
+
+                                                    7
+

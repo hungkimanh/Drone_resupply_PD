@@ -21,11 +21,21 @@ using namespace std;
  *  - Route end:     0     => node = 0, packages = {}
  *  - Customer visit: i    => node = i (>0), packages = {}
  *  - Drone resupply at customer: i[P] => node = i (>0), packages = P
- *    IMPORTANT: i[P] means drone resupply happens before serving i.
+ *    The resupply is synchronized at i. If i can already be served by the
+ *    truck, service happens first; if i needs a package in P, resupply happens
+ *    first.
+ *  - Every C1 package loaded at a depot or supplied by a drone must be
+ *    delivered before the truck's next depot visit. C2 pickup loads may cross
+ *    intermediate depot visits, provided pickup precedes delivery.
  */
 struct RouteStop {
     int node = 0;                 // 0 = depot, >0 = customer
     vector<int> packages;         // depot-load packages if node==0; drone-resupply packages if node>0
+    int fixed_drone_id = -1;      // Optional MILP validation metadata
+    int fixed_drone_trip = -1;    // 1-based sortie order for fixed_drone_id
+    double fixed_drone_depart = -1.0;
+    double fixed_drone_arrive = -1.0;
+    double fixed_drone_return = -1.0;
 
     RouteStop() = default;
     explicit RouteStop(int n) : node(n) {}
