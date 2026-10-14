@@ -21,7 +21,7 @@ on:
         description: 'Instance paths/globs separated by commas or newlines (10-20 customers)'
         type: string
         required: true
-        default: 'Instance/Instance/U_10_0.5_Num_1_pd.txt'
+        default: 'Instance/Instance/U_10_0.5_Num_*_pd.txt,Instance/Instance/U_10_1.0_Num_*_pd.txt'
       max_parallel_jobs:
         description: 'Maximum concurrent solver jobs; each instance creates two jobs'
         type: choice
