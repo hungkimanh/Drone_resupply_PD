@@ -9,6 +9,10 @@
 # from the local workstation or replaced by the pip Community Edition.
 # MILP export retains all default trips/constraints. No warm start, model
 # reduction, search tuning, source replacement or additional solve is applied.
+# Original instances may start with a # comment, a customer, or depot ID 0.
+# Prepare validates every data row and publishes customer-only copies with a
+# generated # header. Both readers add the depot selected by the depot input;
+# both solver jobs consume the same checksummed copy, never rewrite originals.
 # Each selected instance expands into two independent jobs. Paths/globs can be
 # separated by commas or newlines. Example for all 45 bundled small instances:
 # Instance/Instance/U_10_*_pd.txt,Instance/Instance/U_15_*_pd.txt,Instance/Instance/U_20_*_pd.txt
@@ -48,6 +52,7 @@ jobs:
     outputs:
       matrix: ${{ steps.selection.outputs.matrix }}
       max_parallel_jobs: ${{ steps.selection.outputs.max_parallel_jobs }}
+      normalized_artifact: ${{ steps.selection.outputs.normalized_artifact }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +67,7 @@ jobs:
           MAX_PARALLEL_JOBS: ${{ inputs.max_parallel_jobs }}
           RUN_SEED: ${{ inputs.seed }}
           DEPOT: ${{ inputs.depot }}
+          NORMALIZED_ARTIFACT: normalized-instances-${{ github.run_id }}-${{ github.run_attempt }}
         shell: bash
         run: |
           python - <<'PY'
@@ -104,41 +110,81 @@ jobs:
                   # 128 instances * 2 solvers = the 256-job matrix limit.
                   if len(selected) >= 128:
                       raise SystemExit('Select at most 128 unique instances per workflow run.')
-                  raw_lines = path.read_text(encoding='utf-8-sig').splitlines()
-                  if not raw_lines or not raw_lines[0].startswith('#'):
-                      raise SystemExit(f'Expected a # header on the first line: {relative}')
-                  rows = [line.split() for line in raw_lines
-                          if line.strip() and not line.lstrip().startswith('#')]
+                  rows = []
+                  for line_number, line in enumerate(path.read_text(encoding='utf-8-sig').splitlines(), 1):
+                      if not line.strip() or line.lstrip().startswith('#'):
+                          continue
+                      row = line.split()
+                      where = f'{relative}:{line_number}'
+                      if len(row) != 6 or row[3] not in {'D', 'P', 'DL'}:
+                          raise SystemExit(f'Expected six columns: id X Y type ready_time pair_id at {where}')
+                      # C++ reads these fields as integers. Reject fractional or
+                      # nonstandard numeric tokens instead of truncating data.
+                      if any(not re.fullmatch(r'[+-]?[0-9]+', row[j]) for j in (0, 4, 5)):
+                          raise SystemExit(f'IDs, release times and pair IDs must be integers at {where}')
+                      try:
+                          coordinates = [float(row[j]) for j in (1, 2)]
+                      except ValueError:
+                          raise SystemExit(f'Invalid coordinates at {where}')
+                      if any('_' in row[j] for j in (1, 2)) or not all(map(math.isfinite, coordinates)):
+                          raise SystemExit(f'Coordinates must be finite standard numbers at {where}')
+                      if not 0 <= int(row[4]) <= 2147483647 or not -2147483648 <= int(row[5]) <= 2147483647:
+                          raise SystemExit(f'Release time or pair ID outside the C++ integer range at {where}')
+                      rows.append(row)
+
+                  removed_depot = bool(rows and int(rows[0][0]) == 0)
+                  if removed_depot:
+                      # ID 0 is an explicit depot row, not a customer. Its
+                      # coordinates are replaced by --depot in both readers.
+                      if rows[0][3] != 'D' or int(rows[0][4]) != 0 or int(rows[0][5]) != 0:
+                          raise SystemExit(f'Invalid depot row: expected ID 0, type D, release/pair 0 in {relative}')
+                      rows = rows[1:]
                   if not 10 <= len(rows) <= 20:
-                      raise SystemExit(f'Instance must have 10-20 customers: {relative}')
-                  for i, row in enumerate(rows, 1):
-                      if len(row) != 6 or int(row[0]) != i or row[3] not in {'D', 'P', 'DL'}:
-                          raise SystemExit(f'Expected consecutive IDs and six-column PDP format: {relative}')
-                      if not all(math.isfinite(float(row[j])) for j in (1, 2)) or int(row[4]) < 0:
-                          raise SystemExit(f'Invalid coordinates or release time: {relative}')
-                      int(row[5])
-                  selected[relative] = len(rows)
+                      raise SystemExit(f'Instance must have 10-20 customers excluding the depot: {relative}')
+                  if any(int(row[0]) != i for i, row in enumerate(rows, 1)):
+                      raise SystemExit(f'Customer IDs must be consecutive 1..n, with depot 0 only at the start: {relative}')
+                  selected[relative] = {'rows': rows, 'removed_depot': removed_depot}
 
           entries = []
+          normalized_dir = Path(os.environ['RUNNER_TEMP']) / 'pdp-normalized-instances'
+          normalized_dir.mkdir(parents=True, exist_ok=True)
           lines = ['## Selected instances', '',
                    f'{len(selected)} instances; {2 * len(selected)} solver jobs; '
                    f'at most {parallel} concurrent jobs.', '',
-                   '| Instance | Customers |', '|---|---|']
-          for index, (relative, customers) in enumerate(selected.items(), 1):
+                   '| Instance | Customers | Leading depot removed |', '|---|---|---|']
+          for index, (relative, data) in enumerate(selected.items(), 1):
+              customers = len(data['rows'])
               stem = re.sub(r'[^A-Za-z0-9_.-]', '-', Path(relative).stem)[:65]
               digest = hashlib.sha256(relative.encode()).hexdigest()[:8]
               instance_id = f'{index:03d}-{stem}-{digest}'
+              normalized_file = instance_id + '.txt'
+              # Preserve customer order and all six field values. The generated
+              # header is skipped by C++ and ignored as a comment by Python.
+              content = '# id X Y type ready_time pair_id\n' + ''.join(
+                  ' '.join(row) + '\n' for row in data['rows'])
+              normalized_sha256 = hashlib.sha256(content.encode('utf-8')).hexdigest()
+              (normalized_dir / normalized_file).write_bytes(content.encode('utf-8'))
               # Keep each MILP/Tabu pair adjacent in the matrix definition.
               for solver in ('MILP', 'Tabu'):
-                  entries.append({'instance': relative, 'instance_id': instance_id, 'solver': solver})
-              lines.append(f'| {relative.replace("|", "/")} | {customers} |')
+                  entries.append({'instance': relative, 'instance_id': instance_id, 'solver': solver,
+                                  'normalized_file': normalized_file, 'normalized_sha256': normalized_sha256})
+              lines.append(f'| {relative.replace("|", "/")} | {customers} | {data["removed_depot"]} |')
           matrix = json.dumps({'include': entries}, separators=(',', ':'))
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f'matrix={matrix}\nmax_parallel_jobs={parallel}\n')
+              f.write(f'normalized_artifact={os.environ["NORMALIZED_ARTIFACT"]}\n')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
               f.write('\n'.join(lines) + '\n')
           print(f'Prepared {len(selected)} unique instances and {len(entries)} solver jobs.')
           PY
+
+      - name: Publish validated normalized instances for both solvers
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.selection.outputs.normalized_artifact }}
+          path: ${{ runner.temp }}/pdp-normalized-instances/
+          if-no-files-found: error
+          retention-days: 14
 
   solve:
     name: '${{ matrix.solver }} - ${{ matrix.instance }}'
@@ -153,6 +199,8 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       INSTANCE: ${{ matrix.instance }}
+      NORMALIZED_FILE: ${{ matrix.normalized_file }}
+      NORMALIZED_SHA256: ${{ matrix.normalized_sha256 }}
       DEPOT: ${{ inputs.depot }}
       RUN_SEED: ${{ inputs.seed }}
       SOLVER: ${{ matrix.solver }}
@@ -169,22 +217,34 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Validate one instance and record environment
+      - name: Download the validated copies shared by both solvers
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.normalized_artifact }}
+          path: ${{ runner.temp }}/pdp-normalized-instances
+
+      - name: Verify normalized instance and record environment
         run: |
           mkdir -p results
           python - <<'PY'
+          import hashlib
           import math
           import os
           from pathlib import Path
           root = Path.cwd().resolve()
-          path = (root / os.environ['INSTANCE']).resolve()
-          if not path.is_relative_to(root) or not path.is_file() or path.suffix != '.txt':
+          original = (root / os.environ['INSTANCE']).resolve()
+          if not original.is_relative_to(root) or not original.is_file() or original.suffix != '.txt':
               raise SystemExit('Instance must be a .txt file inside this repository.')
+          normalized_dir = (Path(os.environ['RUNNER_TEMP']) / 'pdp-normalized-instances').resolve()
+          path = (normalized_dir / os.environ['NORMALIZED_FILE']).resolve()
+          if path.parent != normalized_dir or not path.is_file():
+              raise SystemExit('The validated normalized instance is missing.')
+          if hashlib.sha256(path.read_bytes()).hexdigest() != os.environ['NORMALIZED_SHA256']:
+              raise SystemExit('Normalized instance checksum differs from the prepare job.')
           raw_lines = path.read_text(encoding='utf-8-sig').splitlines()
-          # C++ unconditionally skips the first line; Python skips # comments.
-          # Require the same header convention so both read identical customers.
-          if not raw_lines or not raw_lines[0].startswith('#'):
-              raise SystemExit('Expected a # header on the first line for both readers.')
+          # This header belongs to the workflow-generated copy, not the source.
+          if not raw_lines or raw_lines[0] != '# id X Y type ready_time pair_id':
+              raise SystemExit('Invalid workflow-generated instance header.')
           rows = [line.split() for line in raw_lines
                   if line.strip() and not line.lstrip().startswith('#')]
           if not 10 <= len(rows) <= 20:
@@ -199,7 +259,12 @@ jobs:
               raise SystemExit('Seed must be an integer in 1..1000000.')
           if os.environ['DEPOT'] not in {'center', 'border', 'outside'}:
               raise SystemExit('Invalid depot.')
-          print(f'Instance: {path.relative_to(root)}; customers: {len(rows)}')
+          print(f'Original instance: {original.relative_to(root)}; customers: {len(rows)}')
+          print(f'Shared normalized input: {path}; SHA-256: {os.environ["NORMALIZED_SHA256"]}')
+          # Artifact contains both the exact source bytes and the exact bytes
+          # passed to either solver, for reproducibility and inspection.
+          Path('results/input_instance_original.txt').write_bytes(original.read_bytes())
+          Path('results/input_instance.txt').write_bytes(path.read_bytes())
           with open(os.environ['GITHUB_ENV'], 'a') as f:
               f.write(f'INSTANCE_PATH={path}\nCUSTOMERS={len(rows)}\n')
           PY
@@ -217,7 +282,6 @@ jobs:
             python --version
             free -h
           } | tee results/environment.txt
-          cp -- "$INSTANCE" results/input_instance.txt
 
       - name: Cache the pinned OR-Tools C++ distribution
         if: matrix.solver == 'Tabu'
@@ -363,6 +427,7 @@ jobs:
           seconds = Path('results/process_seconds.txt')
           metrics = {
               'solver': solver, 'instance': os.environ['INSTANCE'],
+              'normalized_input_sha256': os.environ.get('NORMALIZED_SHA256'),
               'commit': os.environ['GITHUB_SHA'], 'depot': os.environ['DEPOT'],
               'customers': os.environ.get('CUSTOMERS'),
               'available_cpus': os.environ.get('CPU_COUNT'), 'time_limit_seconds': 3600,
