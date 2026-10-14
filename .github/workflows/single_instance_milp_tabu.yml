@@ -9,16 +9,24 @@
 # from the local workstation or replaced by the pip Community Edition.
 # MILP export retains all default trips/constraints. No warm start, model
 # reduction, search tuning, source replacement or additional solve is applied.
-name: Single instance - MILP and Tabu (1 hour each)
+# Each selected instance expands into two independent jobs. Paths/globs can be
+# separated by commas or newlines. Example for all 45 bundled small instances:
+# Instance/Instance/U_10_*_pd.txt,Instance/Instance/U_15_*_pd.txt,Instance/Instance/U_20_*_pd.txt
+name: Instances - MILP and Tabu (1 hour per solver)
 
 on:
   workflow_dispatch:
     inputs:
-      instance:
-        description: 'One repository instance (10-20 customers, six-column format)'
+      instances:
+        description: 'Instance paths/globs separated by commas or newlines (10-20 customers)'
         type: string
         required: true
         default: 'Instance/Instance/U_10_0.5_Num_1_pd.txt'
+      max_parallel_jobs:
+        description: 'Maximum concurrent solver jobs; each instance creates two jobs'
+        type: choice
+        default: '20'
+        options: ['1', '2', '4', '8', '10', '20']
       depot:
         description: 'Same depot for both solvers'
         type: choice
@@ -33,18 +41,118 @@ permissions:
   contents: read
 
 jobs:
+  prepare:
+    name: Validate instances and build matrix
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.selection.outputs.matrix }}
+      max_parallel_jobs: ${{ steps.selection.outputs.max_parallel_jobs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Resolve and validate the full selection before starting solvers
+        id: selection
+        env:
+          INSTANCE_SELECTION: ${{ inputs.instances }}
+          MAX_PARALLEL_JOBS: ${{ inputs.max_parallel_jobs }}
+          RUN_SEED: ${{ inputs.seed }}
+          DEPOT: ${{ inputs.depot }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import math
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path.cwd().resolve()
+          patterns = [entry.strip() for entry in re.split(r'[,\r\n]+', os.environ['INSTANCE_SELECTION'])
+                      if entry.strip()]
+          if not patterns:
+              raise SystemExit('Enter at least one instance path or glob.')
+          if not os.environ['RUN_SEED'].isdigit() or not 1 <= int(os.environ['RUN_SEED']) <= 1000000:
+              raise SystemExit('Seed must be an integer in 1..1000000.')
+          if os.environ['DEPOT'] not in {'center', 'border', 'outside'}:
+              raise SystemExit('Invalid depot.')
+          parallel = int(os.environ['MAX_PARALLEL_JOBS'])
+          if not 1 <= parallel <= 20:
+              raise SystemExit('Maximum concurrent jobs must be in 1..20.')
+
+          selected = {}
+          for pattern in patterns:
+              if Path(pattern).is_absolute():
+                  raise SystemExit('Use paths/globs relative to the repository root.')
+              matches = sorted(root.glob(pattern))
+              if not matches:
+                  raise SystemExit(f'No instance matched: {pattern}')
+              for match in matches:
+                  path = match.resolve()
+                  if not path.is_relative_to(root) or not path.is_file() or path.suffix != '.txt':
+                      raise SystemExit(f'Instance must be a repository .txt file: {match}')
+                  relative = path.relative_to(root).as_posix()
+                  if any(ord(ch) < 32 for ch in relative):
+                      raise SystemExit('Control characters are not allowed in instance paths.')
+                  if relative in selected:
+                      continue
+                  # 128 instances * 2 solvers = the 256-job matrix limit.
+                  if len(selected) >= 128:
+                      raise SystemExit('Select at most 128 unique instances per workflow run.')
+                  raw_lines = path.read_text(encoding='utf-8-sig').splitlines()
+                  if not raw_lines or not raw_lines[0].startswith('#'):
+                      raise SystemExit(f'Expected a # header on the first line: {relative}')
+                  rows = [line.split() for line in raw_lines
+                          if line.strip() and not line.lstrip().startswith('#')]
+                  if not 10 <= len(rows) <= 20:
+                      raise SystemExit(f'Instance must have 10-20 customers: {relative}')
+                  for i, row in enumerate(rows, 1):
+                      if len(row) != 6 or int(row[0]) != i or row[3] not in {'D', 'P', 'DL'}:
+                          raise SystemExit(f'Expected consecutive IDs and six-column PDP format: {relative}')
+                      if not all(math.isfinite(float(row[j])) for j in (1, 2)) or int(row[4]) < 0:
+                          raise SystemExit(f'Invalid coordinates or release time: {relative}')
+                      int(row[5])
+                  selected[relative] = len(rows)
+
+          entries = []
+          lines = ['## Selected instances', '',
+                   f'{len(selected)} instances; {2 * len(selected)} solver jobs; '
+                   f'at most {parallel} concurrent jobs.', '',
+                   '| Instance | Customers |', '|---|---|']
+          for index, (relative, customers) in enumerate(selected.items(), 1):
+              stem = re.sub(r'[^A-Za-z0-9_.-]', '-', Path(relative).stem)[:65]
+              digest = hashlib.sha256(relative.encode()).hexdigest()[:8]
+              instance_id = f'{index:03d}-{stem}-{digest}'
+              # Keep each MILP/Tabu pair adjacent in the matrix definition.
+              for solver in ('MILP', 'Tabu'):
+                  entries.append({'instance': relative, 'instance_id': instance_id, 'solver': solver})
+              lines.append(f'| {relative.replace("|", "/")} | {customers} |')
+          matrix = json.dumps({'include': entries}, separators=(',', ':'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'matrix={matrix}\nmax_parallel_jobs={parallel}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('\n'.join(lines) + '\n')
+          print(f'Prepared {len(selected)} unique instances and {len(entries)} solver jobs.')
+          PY
+
   solve:
-    name: '${{ matrix.solver }} - ${{ inputs.instance }}'
+    name: '${{ matrix.solver }} - ${{ matrix.instance }}'
+    needs: prepare
     runs-on: ubuntu-22.04
     # Setup/export are outside the solver's 3600-second budget. Reserve time
     # for a 20-customer model export and for publishing results after a failure.
     timeout-minutes: 150
     strategy:
       fail-fast: false
-      matrix:
-        solver: [MILP, Tabu]
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.max_parallel_jobs) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      INSTANCE: ${{ inputs.instance }}
+      INSTANCE: ${{ matrix.instance }}
       DEPOT: ${{ inputs.depot }}
       RUN_SEED: ${{ inputs.seed }}
       SOLVER: ${{ matrix.solver }}
@@ -347,7 +455,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: '${{ matrix.solver }}-${{ github.run_id }}-${{ github.run_attempt }}'
+          name: '${{ matrix.solver }}-${{ matrix.instance_id }}-${{ github.run_id }}-${{ github.run_attempt }}'
           path: |
             results/
             cplex.log
