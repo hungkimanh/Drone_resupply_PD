@@ -1,0 +1,356 @@
+# Source files are never patched. MILP.py exports the model; CPLEX CLI solves it.
+# Prerequisite for MILP: repository secret CPLEX_STUDIO_ARCHIVE_URL pointing to
+# a private HTTPS .tar.gz of a licensed Linux x86-64 CPLEX Studio installation.
+# Archive layout: CPLEX_Studio2211/cplex/bin/x86-64_linux/cplex (and its libraries).
+# Do not upload the proprietary archive as an Actions artifact or commit it.
+# Tabu's CP-SAT workers are hard-coded to 4 in src/pdp_lsp.cpp; YAML cannot
+# increase this. Its routing search is sequential. Build uses all visible CPUs.
+# A licensed CPLEX archive must be supplied separately; it cannot be inferred
+# from the local workstation or replaced by the pip Community Edition.
+# MILP export retains all default trips/constraints. No warm start, model
+# reduction, search tuning, source replacement or additional solve is applied.
+name: Single instance - MILP and Tabu (1 hour each)
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: 'One repository instance (10-20 customers, six-column format)'
+        type: string
+        required: true
+        default: 'Instance/Instance/U_10_0.5_Num_1_pd.txt'
+      depot:
+        description: 'Same depot for both solvers'
+        type: choice
+        default: border
+        options: [center, border, outside]
+      seed:
+        description: 'Positive integer run number for Tabu'
+        type: string
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  solve:
+    name: '${{ matrix.solver }} - ${{ inputs.instance }}'
+    runs-on: ubuntu-22.04
+    # Setup/export are outside the solver's 3600-second budget. Reserve time
+    # for a 20-customer model export and for publishing results after a failure.
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        solver: [MILP, Tabu]
+    env:
+      INSTANCE: ${{ inputs.instance }}
+      DEPOT: ${{ inputs.depot }}
+      RUN_SEED: ${{ inputs.seed }}
+      SOLVER: ${{ matrix.solver }}
+      TIME_LIMIT: '3600'
+      OR_TOOLS_URL: https://github.com/google/or-tools/releases/download/v9.11/or-tools_amd64_ubuntu-22.04_cpp_v9.11.4210.tar.gz
+      PYTHONUNBUFFERED: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Validate one instance and record environment
+        run: |
+          mkdir -p results
+          python - <<'PY'
+          import math
+          import os
+          from pathlib import Path
+          root = Path.cwd().resolve()
+          path = (root / os.environ['INSTANCE']).resolve()
+          if not path.is_relative_to(root) or not path.is_file() or path.suffix != '.txt':
+              raise SystemExit('Instance must be a .txt file inside this repository.')
+          raw_lines = path.read_text(encoding='utf-8-sig').splitlines()
+          # C++ unconditionally skips the first line; Python skips # comments.
+          # Require the same header convention so both read identical customers.
+          if not raw_lines or not raw_lines[0].startswith('#'):
+              raise SystemExit('Expected a # header on the first line for both readers.')
+          rows = [line.split() for line in raw_lines
+                  if line.strip() and not line.lstrip().startswith('#')]
+          if not 10 <= len(rows) <= 20:
+              raise SystemExit('Select exactly one instance with 10-20 customers.')
+          for i, row in enumerate(rows, 1):
+              if len(row) != 6 or int(row[0]) != i or row[3] not in {'D', 'P', 'DL'}:
+                  raise SystemExit('Expected consecutive IDs 1..n and six-column PDP format.')
+              if not all(math.isfinite(float(row[j])) for j in (1, 2)) or int(row[4]) < 0:
+                  raise SystemExit('Coordinates must be finite; release times must be nonnegative integers.')
+              int(row[5])
+          if not os.environ['RUN_SEED'].isdigit() or not 1 <= int(os.environ['RUN_SEED']) <= 1000000:
+              raise SystemExit('Seed must be an integer in 1..1000000.')
+          if os.environ['DEPOT'] not in {'center', 'border', 'outside'}:
+              raise SystemExit('Invalid depot.')
+          print(f'Instance: {path.relative_to(root)}; customers: {len(rows)}')
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'INSTANCE_PATH={path}\nCUSTOMERS={len(rows)}\n')
+          PY
+          cpu_count=$(nproc)
+          echo "CPU_COUNT=$cpu_count" >> "$GITHUB_ENV"
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "instance=$INSTANCE"
+            echo "depot=$DEPOT"
+            echo "solver=$SOLVER"
+            echo "cpu_count=$cpu_count"
+            echo "time_limit=$TIME_LIMIT"
+            echo 'Tabu CP-SAT workers=4 (source constant); routing search=sequential'
+            uname -a
+            python --version
+            free -h
+          } | tee results/environment.txt
+          cp -- "$INSTANCE" results/input_instance.txt
+
+      - name: Cache the pinned OR-Tools C++ distribution
+        if: matrix.solver == 'Tabu'
+        id: ortools-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/or-tools
+          key: ortools-9.11.4210-ubuntu-22.04-x86-64-v1
+
+      - name: Install Linux build dependencies
+        if: matrix.solver == 'Tabu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ zlib1g-dev curl
+
+      - name: Install OR-Tools C++ distribution
+        if: matrix.solver == 'Tabu' && steps.ortools-cache.outputs.cache-hit != 'true'
+        run: |
+          ortools_dir="$RUNNER_TEMP/or-tools"
+          mkdir -p "$ortools_dir"
+          curl --fail --location --retry 3 "$OR_TOOLS_URL" -o "$RUNNER_TEMP/or-tools.tar.gz"
+          tar -xzf "$RUNNER_TEMP/or-tools.tar.gz" -C "$ortools_dir" --strip-components=1
+
+      - name: Configure OR-Tools runtime paths
+        if: matrix.solver == 'Tabu'
+        run: |
+          echo "ORTOOLS_DIR=$RUNNER_TEMP/or-tools" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/or-tools/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Build existing Tabu target
+        if: matrix.solver == 'Tabu'
+        run: |
+          cmake -S . -B "$RUNNER_TEMP/pdp-build" \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+            -DCMAKE_PREFIX_PATH="$ORTOOLS_DIR" 2>&1 | tee results/build.log
+          cmake --build "$RUNNER_TEMP/pdp-build" --target pdp_solver --parallel "$CPU_COUNT" \
+            2>&1 | tee -a results/build.log
+          ldd ./pdp_solver | tee results/runtime_libraries.txt
+          if grep -q 'not found' results/runtime_libraries.txt; then exit 1; fi
+
+      - name: Install MILP modeling dependency and licensed CPLEX
+        if: matrix.solver == 'MILP'
+        env:
+          CPLEX_ARCHIVE_URL: ${{ secrets.CPLEX_STUDIO_ARCHIVE_URL }}
+        run: |
+          if [[ -z "$CPLEX_ARCHIVE_URL" || "$CPLEX_ARCHIVE_URL" != https://* ]]; then
+            echo '::error::Set CPLEX_STUDIO_ARCHIVE_URL to a private HTTPS archive of your licensed Linux CPLEX Studio installation.'
+            exit 1
+          fi
+          python -m pip install --disable-pip-version-check docplex==2.32.264
+          cplex_dir="$RUNNER_TEMP/cplex-studio"
+          mkdir -p "$cplex_dir"
+          curl --fail --silent --show-error --location --retry 3 \
+            "$CPLEX_ARCHIVE_URL" -o "$RUNNER_TEMP/cplex-studio.tar.gz"
+          tar -xzf "$RUNNER_TEMP/cplex-studio.tar.gz" -C "$cplex_dir"
+          mapfile -t binaries < <(find "$cplex_dir" -type f -path '*/cplex/bin/x86-64_linux/cplex')
+          if [[ ${#binaries[@]} -ne 1 ]]; then
+            echo '::error::Archive must contain exactly one Linux CPLEX executable and its installation libraries.'
+            exit 1
+          fi
+          test -x "${binaries[0]}"
+          echo "CPLEX_BIN=${binaries[0]}" >> "$GITHUB_ENV"
+          # Startup only: no extra optimization experiment.
+          "${binaries[0]}" -c quit | tee results/cplex_version.txt
+          if grep -qi 'Community Edition' results/cplex_version.txt; then
+            echo '::error::Provide the full academic/licensed CPLEX runtime, not Community Edition.'
+            exit 1
+          fi
+
+      - name: Export the existing MILP model without solving
+        if: matrix.solver == 'MILP'
+        timeout-minutes: 45
+        run: |
+          python -u MILP.py "$INSTANCE_PATH" --depot "$DEPOT" --time "$TIME_LIMIT" \
+            --no-solve --export-lp results/milp_model.lp 2>&1 | tee results/model_build.log
+
+      - name: Solve MILP with all visible CPUs and 3600-second limit
+        if: matrix.solver == 'MILP'
+        timeout-minutes: 65
+        run: |
+          # CLI avoids MILP.py's fixed Python threads=8 without modifying code.
+          cat > results/cplex_commands.txt <<EOF
+          read "results/milp_model.lp"
+          set threads $CPU_COUNT
+          set clocktype 2
+          set timelimit $TIME_LIMIT
+          write "results/cplex_parameters.prm"
+          optimize
+          display solution objective
+          write "results/milp_solution.sol"
+          quit
+          EOF
+          set +e
+          started=$(date +%s)
+          timeout --signal=TERM --kill-after=30s 3780s \
+            stdbuf -oL -eL "$CPLEX_BIN" < results/cplex_commands.txt 2>&1 | tee results/milp.log
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          echo "${codes[0]}" > results/exit_code.txt
+          echo "$(( $(date +%s) - started ))" > results/process_seconds.txt
+          if [[ ${codes[0]} -ne 0 || ${codes[1]} -ne 0 ]]; then exit 1; fi
+          # Semantic result checks run in the summary step, including when this
+          # process exits 0 on a CPLEX license/model error.
+
+      - name: Run existing Tabu solver with 3600-second budget
+        if: matrix.solver == 'Tabu'
+        timeout-minutes: 65
+        run: |
+          case "$DEPOT" in
+            center) depot_mode=0 ;;
+            border) depot_mode=1 ;;
+            outside) depot_mode=2 ;;
+          esac
+          set +e
+          started=$(date +%s)
+          # Grace allows an in-flight LSP/ALNS call and final validation to finish.
+          timeout --signal=TERM --kill-after=30s 3780s \
+            stdbuf -oL -eL ./pdp_solver "$INSTANCE_PATH" --depot "$depot_mode" \
+              --run "$RUN_SEED" --time "$TIME_LIMIT" \
+              --encoding-output results/tabu_encoding.txt 2>&1 | tee results/tabu.log
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          echo "${codes[0]}" > results/exit_code.txt
+          echo "$(( $(date +%s) - started ))" > results/process_seconds.txt
+          if [[ ${codes[0]} -ne 0 || ${codes[1]} -ne 0 ]]; then exit 1; fi
+
+      - name: Validate solver outcome and publish summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import math
+          import os
+          import re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          solver = os.environ['SOLVER']
+          results = Path('results')
+          results.mkdir(exist_ok=True)
+          code = Path('results/exit_code.txt')
+          log = Path(f'results/{solver.lower()}.log')
+          text = log.read_text(errors='replace') if log.exists() else ''
+          seconds = Path('results/process_seconds.txt')
+          metrics = {
+              'solver': solver, 'instance': os.environ['INSTANCE'],
+              'commit': os.environ['GITHUB_SHA'], 'depot': os.environ['DEPOT'],
+              'customers': os.environ.get('CUSTOMERS'),
+              'available_cpus': os.environ.get('CPU_COUNT'), 'time_limit_seconds': 3600,
+              'process_seconds': int(seconds.read_text()) if seconds.exists() else None,
+              'exit_code': int(code.read_text()) if code.exists() else None,
+              'status': 'not_completed_or_started', 'objective': None,
+              'tabu_seed': os.environ['RUN_SEED'] if solver == 'Tabu' else None,
+          }
+          errors = []
+          sol = Path('results/milp_solution.sol')
+          if metrics['exit_code'] is not None and metrics['exit_code'] != 0:
+              metrics['status'] = 'watchdog_timeout' if metrics['exit_code'] in (124, 137) else 'process_failed'
+              errors.append(f"Solver process exit code {metrics['exit_code']}")
+          elif metrics['exit_code'] == 0 and solver == 'MILP':
+              no_incumbent = bool(re.search(
+                  r'MIP - (?:Time limit exceeded, no integer solution|Integer infeasible)', text))
+              # Error 1217 is expected ONLY when an otherwise successful search
+              # has no incumbent to display/write. Every other CPLEX error fails.
+              error_codes = re.findall(r'CPLEX Error\s+(\d+)', text)
+              errors.extend(f'CPLEX Error {c}' for c in error_codes
+                            if c != '1217' or not no_incumbent or sol.exists())
+              if sol.exists():
+                  try:
+                      header = ET.parse(sol).getroot().find('header')
+                      metrics['objective'] = float(header.attrib['objectiveValue'])
+                      metrics['status'] = header.attrib.get('solutionStatusString', 'feasible')
+                      metrics['cplex_solution_header'] = header.attrib
+                      if not math.isfinite(metrics['objective']):
+                          errors.append('CPLEX objective is not finite.')
+                  except (ET.ParseError, AttributeError, KeyError, ValueError) as exc:
+                      errors.append(f'Invalid CPLEX solution: {exc}')
+              elif no_incumbent:
+                  metrics['status'] = 'time_limit_no_incumbent' if 'Time limit exceeded' in text else 'infeasible'
+              else:
+                  errors.append('No CPLEX solution or recognized no-incumbent termination.')
+              required = [
+                  f"New value for default parallel thread count: {os.environ['CPU_COUNT']}",
+                  'New value for type of clock used to measure time: 2',
+                  'New value for time limit in seconds: 3600',
+              ]
+              if any(value not in text for value in required):
+                  errors.append('CPLEX did not confirm the required CPU/time settings.')
+          elif metrics['exit_code'] == 0 and solver == 'Tabu':
+              enc = Path('results/tabu_encoding.txt')
+              match = re.search(r'C_max \(verified\):\s*([\d.]+)', text)
+              if match and enc.exists() and 'Feasible       : YES' in text:
+                  metrics['objective'] = float(match.group(1))
+                  metrics['status'] = 'verified_feasible'
+                  try:
+                      first = enc.read_text().splitlines()[0].split()
+                      objective = float(first[1])
+                      if first[0] != 'HEURISTIC_CMAX' or not math.isfinite(objective):
+                          raise ValueError('Invalid objective header')
+                      if abs(objective - metrics['objective']) > 0.011:
+                          raise ValueError('Encoding objective differs from verified log')
+                      metrics['objective'] = objective
+                  except (IndexError, ValueError) as exc:
+                      errors.append(f'Invalid verified Tabu encoding: {exc}')
+              elif 'No feasible solution found.' in text and '[RUNTIME]' in text:
+                  metrics['status'] = 'no_feasible_solution'
+              else:
+                  errors.append('Tabu has no verified final result.')
+          metrics['errors'] = errors
+          if errors:
+              metrics['status'] = 'failed'
+          (results / 'result.json').write_text(json.dumps(metrics, indent=2) + '\n')
+          lines = [f'## {solver}', '', '| Metric | Value |', '|---|---|']
+          for key in ('instance', 'depot', 'customers', 'available_cpus', 'time_limit_seconds',
+                      'process_seconds', 'exit_code', 'status', 'objective'):
+              lines.append(f"| {key} | {str(metrics.get(key)).replace('|', '/')} |")
+          if errors:
+              lines.extend(['', 'Validation errors:', *[f'- {error}' for error in errors]])
+          if text:
+              lines.extend(['', 'Last log lines:', '```', '\n'.join(text.splitlines()[-35:]), '```'])
+          else:
+              lines.extend(['', 'No solver log; inspect setup/build steps for errors.'])
+          lines.extend(['', 'Full logs, input, model/solution and Tabu encoding are in the job artifact.',
+                        'Tabu routing is sequential; CP-SAT uses the source constant of 4 workers.',
+                        'The 3600-second solver limits exclude dependency setup and MILP model export.',
+                        'Tabu may finish an in-flight evaluation after its time budget.'])
+          summary = '\n'.join(lines) + '\n'
+          Path('results/summary.md').write_text(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(summary)
+          if errors:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload logs and results even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: '${{ matrix.solver }}-${{ github.run_id }}-${{ github.run_attempt }}'
+          path: |
+            results/
+            cplex.log
+            clone*.log
+          if-no-files-found: warn
+          retention-days: 14
