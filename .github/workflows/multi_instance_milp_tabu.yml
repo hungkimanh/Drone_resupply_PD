@@ -16,6 +16,8 @@
 # Each selected instance expands into two independent jobs. Paths/globs can be
 # separated by commas or newlines. Example for all 45 bundled small instances:
 # Instance/Instance/U_10_*_pd.txt,Instance/Instance/U_15_*_pd.txt,Instance/Instance/U_20_*_pd.txt
+# A final job joins lightweight result artifacts into comparison/milp_vs_tabu.csv.
+# Paper comparisons use the local Results CSVs and verified original customer data.
 name: Instances - MILP and Tabu (1 hour per solver)
 
 on:
@@ -25,7 +27,7 @@ on:
         description: 'Instance paths/globs separated by commas or newlines (10-20 customers)'
         type: string
         required: true
-        default: 'Instance/Instance/U_10_0.5_Num_*_pd.txt,Instance/Instance/U_10_1.0_Num_*_pd.txt'
+        default: 'Instances 2/U_10_0.5_Num_[1-5].txt,Instances 2/U_10_1.0_Num_[1-5].txt'
       max_parallel_jobs:
         description: 'Maximum concurrent solver jobs; each instance creates two jobs'
         type: choice
@@ -427,6 +429,8 @@ jobs:
           seconds = Path('results/process_seconds.txt')
           metrics = {
               'solver': solver, 'instance': os.environ['INSTANCE'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
               'normalized_input_sha256': os.environ.get('NORMALIZED_SHA256'),
               'commit': os.environ['GITHUB_SHA'], 'depot': os.environ['DEPOT'],
               'customers': os.environ.get('CUSTOMERS'),
@@ -516,6 +520,15 @@ jobs:
               raise SystemExit(1)
           PY
 
+      - name: Upload lightweight metrics for the comparison CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 'metrics-${{ matrix.solver }}-${{ matrix.instance_id }}-${{ github.run_id }}-${{ github.run_attempt }}'
+          path: results/result.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Upload logs and results even on failure
         if: always()
         uses: actions/upload-artifact@v4
@@ -526,4 +539,389 @@ jobs:
             cplex.log
             clone*.log
           if-no-files-found: warn
+          retention-days: 14
+
+  compare:
+    name: Export MILP, Tabu and paper comparison CSV
+    needs: [prepare, solve]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      INSTANCE_MATRIX: ${{ needs.prepare.outputs.matrix }}
+      PREPARE_ARTIFACT: ${{ needs.prepare.outputs.normalized_artifact }}
+      DEPOT: ${{ inputs.depot }}
+      RUN_SEED: ${{ inputs.seed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: Results
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # Keep each result in its own artifact directory. Never merge result.json
+      # files or download the large LP models just to produce the CSV.
+      - name: Download solver metrics from this workflow run
+        id: metrics_download
+        uses: actions/download-artifact@v4
+        with:
+          pattern: metrics-*-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/pdp-comparison-metrics
+          merge-multiple: false
+
+      - name: Download the exact inputs used by the solvers for paper matching
+        if: ${{ !cancelled() }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.normalized_artifact }}
+          path: ${{ runner.temp }}/pdp-comparison-inputs
+
+      - name: Join MILP and Tabu results by the validated instance
+        if: ${{ !cancelled() }}
+        env:
+          METRICS_DOWNLOAD_OUTCOME: ${{ steps.metrics_download.outcome }}
+          METRICS_DIR: ${{ runner.temp }}/pdp-comparison-metrics
+          SHARED_INPUT_DIR: ${{ runner.temp }}/pdp-comparison-inputs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          import os
+          import re
+          from decimal import Decimal, InvalidOperation
+          from pathlib import Path
+
+          entries = json.loads(os.environ['INSTANCE_MATRIX'])['include']
+          root = Path(os.environ['METRICS_DIR'])
+          run_id = os.environ['GITHUB_RUN_ID']
+          run_attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
+          # A failed-job rerun can reuse successful results from earlier attempts.
+          # A fresh prepare job must never reuse results predating its own input.
+          first_attempt = int(os.environ['PREPARE_ARTIFACT'].rsplit('-', 1)[1])
+
+          def canonical_number(value):
+              try:
+                  number = Decimal(value)
+              except InvalidOperation as error:
+                  raise ValueError('Invalid numeric benchmark field.') from error
+              if not number.is_finite():
+                  raise ValueError('Nonfinite numeric benchmark field.')
+              return '0' if number == 0 else format(number.normalize(), 'f')
+
+          # Original Instances.zip from jcpinap/VRPRD-DR, revision
+          # 851ab6aea35ba1ab4de75c9bd7598e7c9cccb619. Signatures hash compact JSON
+          # [[canonical X, canonical Y, integer release], ...] in customer order.
+          # All original customers are deliveries with no pickup/delivery pairing.
+          PAPER_SIGNATURES = {
+              'U_10_0.5_Num_1.txt': '87d8b53ba787e3bd8d018af356b7129f83469b555638d7ce047a0ec48b1407e5',
+              'U_10_0.5_Num_2.txt': '7c9be50dbd5975e5ad1308b5374a8e5cbb215a197e339783c451594ab51c1e0d',
+              'U_10_0.5_Num_3.txt': 'a0bb0f971d9f99cb70bfe43fcf90d402c52d8d8b0b5b765f9dc17212c0ea8fcf',
+              'U_10_0.5_Num_4.txt': 'ccae7ed1d485667dfe78783b60af20b07b924d07193e836368602d5808ca6a0c',
+              'U_10_0.5_Num_5.txt': 'd687ad5a71c76064fbbd1fbe9ec64c69a6a49f792cfc400564fe7128b20f1cb5',
+              'U_10_1.0_Num_1.txt': '9d0c29ebb68016d968bfeb831a136ed53e131f80718606b5472a8188c594462f',
+              'U_10_1.0_Num_2.txt': 'fd159bf0072de9008ddd48c5e884c74978c9911697f51bdd1e692b5629b780b3',
+              'U_10_1.0_Num_3.txt': 'd041685c5e57d7fd8c6249fcb16edbe003166b018337911a3f1a1b902d84dc1b',
+              'U_10_1.0_Num_4.txt': '3887e08d7fe1e74de29a9a2ae5bdda6569f0a8eff517216699dd7cffa2c2fc80',
+              'U_10_1.0_Num_5.txt': 'ef5fb209cbd45cf8ad46825774214053136b3e7f6cd930f40227c14fe2ef2e81',
+              'U_10_1.5_Num_1.txt': 'b4ca8049a22f1f7eab80bebb4e6a9b3753caf74cc85d8465b354d41ceff27edc',
+              'U_10_1.5_Num_2.txt': '29d153a42f3917c07cc9cc44bb58fda93b27891d37e2d674a308e652d363c4fe',
+              'U_10_1.5_Num_3.txt': 'a47c076fbb27d94db790f1b2bf2d040c6d66d94dab331eb7eae5a96709aecc72',
+              'U_10_1.5_Num_4.txt': '730239dce608f340958d94cba8f41b921d2790809895655a3a811817e348f353',
+              'U_10_1.5_Num_5.txt': 'e72fb4a64865e92e4d64ff5ff6e9b108e4ce2aebef29d82a8f5cab9d94c52c74',
+              'U_15_0.5_Num_1.txt': '14c1b3762f2368f854178df15154e86b144c4c510838374394df4d61ddfdec8d',
+              'U_15_0.5_Num_2.txt': '82b75d0c18bb344358e3c4d184966d46eff6a3171d7ca2dc6df9b67cda9915e6',
+              'U_15_0.5_Num_3.txt': '0aaf9a23a6690c9cf828d2c7276e15aa7655fcd00ab30289970343b39d8c7901',
+              'U_15_0.5_Num_4.txt': '59d389963b1c71c24b420b77d73d2ad3aaf7e44023b8eb2daf122e8ec435f6ad',
+              'U_15_0.5_Num_5.txt': '08478bd7457124051d5d77a41829522e3dac308f199b86c9a2e61b216d607bd7',
+              'U_15_1.0_Num_1.txt': 'b1594c2fbdca836bdd645d97b218da834fef2409d93d97dbd4af7c5ffce61b3e',
+              'U_15_1.0_Num_2.txt': 'bca9696b3b729c88928ed59b988d7b62141d6999b16bf4466f2a87055f705e83',
+              'U_15_1.0_Num_3.txt': 'b55fa314832dd6b3e8e2c364d58868a393d4c4d804ef5afc7ca231a3bea997ad',
+              'U_15_1.0_Num_4.txt': '726a6118a88f289895f2d85ad0252336b5982c46109a8ed2a9db58b6f7b8328a',
+              'U_15_1.0_Num_5.txt': 'df14efc125921867a18695e304383b17675ff12a39aca2f5a7edb3b82b066144',
+              'U_15_1.5_Num_1.txt': '5c0bda9301230bed17a4c86547363c4c2d8980d54e72967a92c3217587b9cedf',
+              'U_15_1.5_Num_2.txt': 'd87bdaeda39b42c88fce5ab0325f87d5e041aafcee113112d9edcf4c14407588',
+              'U_15_1.5_Num_3.txt': '10d2126f2d6dedb77f70ba412263577d58ef011473011b91d7ed6dff3e34dcbb',
+              'U_15_1.5_Num_4.txt': '3a4faedeb09db87ab0c5841adc1dc3afce1583d65c12b96be908d86fc9c9b31d',
+              'U_15_1.5_Num_5.txt': '6082a337b31af648bc1bd6ab64e603a3ddcb1eb237e263f5bf988208858445bb',
+              'U_20_0.5_Num_1.txt': '17887b6633c73377dd9159a5284efc4038fe24d5e458b39d40d1788d99bbd5df',
+              'U_20_0.5_Num_2.txt': 'b6b4914ac1c484dbf1a9fe0088cd3a5602cf172c477fa81dfe463f0cade13170',
+              'U_20_0.5_Num_3.txt': '778f15427df69da707308fc2c1f743da3112e5aea52e88d2fe9be4eab6f742a9',
+              'U_20_0.5_Num_4.txt': 'c8056436e411e3b696045f1ef5019f110506dc13e18155dadef0a2eb12232a95',
+              'U_20_0.5_Num_5.txt': '6ebba78a5e343d062bf1a38235b30a4bcbe03e7447f1e0c9225e70bcd094a5a0',
+              'U_20_1.0_Num_1.txt': '85f73031e11d2260eb1c09d5b64b5b8b9a823cd3439c054f18d9525da2989817',
+              'U_20_1.0_Num_2.txt': 'caed996adae68117a337b0f693351d2d3095462a1806700f98d4aea5fae073f2',
+              'U_20_1.0_Num_3.txt': 'efeff564e49eca270416b380019d8df6b5ccd7363252fbcc1c32fcdde429b703',
+              'U_20_1.0_Num_4.txt': '8c36c38a17395025dd35e8ada94c30527af827cacb56f6d0c02d83b6b62dbfe8',
+              'U_20_1.0_Num_5.txt': '75513a962cdea1110cb4cc52781a6a1664cc4cf401190a6d5b8197068c842dd7',
+              'U_20_1.5_Num_1.txt': '16b016f311d05c948a7751d574ad7460d5904c78bca3fe837fb2e089f5e55911',
+              'U_20_1.5_Num_2.txt': '5ff6533d435993c3b29a6a1cd0982795d6ce9decc5c6c6bcf6fc361bc3eb2d46',
+              'U_20_1.5_Num_3.txt': '2444328857225c39d32bd204b779748a6f2188aec952df16ace1a3f0cdc23151',
+              'U_20_1.5_Num_4.txt': 'd4876e35359a23460b3cd710c0b13412801e24eec35a28059bf6148c2f4185b4',
+              'U_20_1.5_Num_5.txt': '18a00d3c1ffd946b95ac165b7a81dd25cb4e8f97caacc9367ac489f20810ad6c',
+          }
+          signatures = {}
+          for name, signature in PAPER_SIGNATURES.items():
+              match = re.fullmatch(r'U_(\d+)_([0-9.]+)_Num_(\d+)\.txt', name)
+              signatures[(int(match[1]), canonical_number(match[2]), int(match[3]))] = signature
+
+          reference_files = {
+              'MILP': 'Truck-and-Drone (Limited Drone Fleet) MILP Model Results.csv',
+              'MH10': 'Truck-and-Drone (Limited Drone Fleet) Matheuristic Results - 10 customers.csv',
+              'MH15_20': 'Truck-and-Drone (Limited Drone Fleet) Matheuristic Results - 15 and 20 customers.csv',
+          }
+          references, reference_errors = {}, {}
+          for label, filename in reference_files.items():
+              references[label] = {}
+              try:
+                  with (Path('Results') / filename).open(encoding='utf-8-sig', newline='') as stream:
+                      for record in csv.DictReader(stream):
+                          if not any(record.values()):
+                              continue
+                          key = (int(record['Customers']), record['Depot location'].strip().casefold(),
+                                 int(record['Instance']), canonical_number(record['Beta']),
+                                 int(record['Drone capacity']), int(record['Trucks']), int(record['Drones']))
+                          if key in references[label]:
+                              raise ValueError('Duplicate benchmark configuration.')
+                          objective = float(record['Objective value'])
+                          if not math.isfinite(objective) or objective < 0:
+                              raise ValueError('Invalid paper objective.')
+                          references[label][key] = record
+              except (OSError, ValueError, KeyError, TypeError, csv.Error) as error:
+                  references[label] = {}
+                  reference_errors[label] = f'{filename}: {error}'
+
+          def paper_result(entry):
+              result = {
+                  'paper_match_status': 'no_published_result', 'paper_match_note': '',
+                  'paper_beta': None, 'paper_instance_number': None,
+                  'paper_milp_objective': None, 'paper_matheuristic_objective': None,
+                  'paper_milp_gap': None, 'paper_milp_source': None, 'paper_matheuristic_source': None,
+                  'milp_vs_paper_milp_pct': None,
+                  'tabu_vs_paper_milp_pct': None,
+                  'milp_vs_paper_matheuristic_pct': None,
+                  'tabu_vs_paper_matheuristic_pct': None,
+              }
+              match = re.fullmatch(r'U_(\d+)_([0-9]+(?:\.[0-9]+)?)_Num_(\d+)(?:_pd|_all_d)?\.txt',
+                                   Path(entry['instance']).name)
+              if not match:
+                  result.update(paper_match_status='unsupported_instance_name',
+                                paper_match_note='No unambiguous U_n_beta_Num_i benchmark identifier.')
+                  return result
+              customers, beta, number = int(match[1]), canonical_number(match[2]), int(match[3])
+              result.update(paper_beta=beta, paper_instance_number=number)
+              expected_signature = signatures.get((customers, beta, number))
+              if expected_signature is None:
+                  result['paper_match_note'] = 'The downloaded small-instance tables cover n=10/15/20, beta=0.5/1.0/1.5, Num=1..5.'
+                  return result
+              try:
+                  raw = (Path(os.environ['SHARED_INPUT_DIR']) / entry['normalized_file']).read_bytes()
+                  if hashlib.sha256(raw).hexdigest() != entry['normalized_sha256']:
+                      raise ValueError('Shared input checksum differs from the solver input.')
+                  customer_rows = [line.split() for line in raw.decode('utf-8-sig').splitlines()
+                                   if line.strip() and not line.lstrip().startswith('#')]
+                  if len(customer_rows) != customers or any(len(row) != 6 or int(row[0]) != i
+                                                            for i, row in enumerate(customer_rows, 1)):
+                      raise ValueError('Customer count/order differs from the benchmark identifier.')
+                  if any(row[3] != 'D' or int(row[5]) != 0 for row in customer_rows):
+                      result.update(paper_match_status='pickup_delivery_variant',
+                                    paper_match_note='Published VRPRD-DR results are for delivery-only instances; this input has pickups or pairs.')
+                      return result
+                  projection = [[canonical_number(row[1]), canonical_number(row[2]), str(int(row[4]))]
+                                for row in customer_rows]
+                  signature = hashlib.sha256(json.dumps(projection, separators=(',', ':')).encode()).hexdigest()
+                  if signature != expected_signature:
+                      result.update(paper_match_status='instance_data_mismatch',
+                                    paper_match_note='Customer coordinates or release times differ from the original paper instance.')
+                      return result
+              except (OSError, ValueError, IndexError) as error:
+                  result.update(paper_match_status='input_not_verified', paper_match_note=str(error))
+                  return result
+              # Both unmodified solvers use two trucks, two drones and capacity 2
+              # for 10-20 customers. Never mix with Truck-Only or Unlimited Fleet.
+              key = (customers, os.environ['DEPOT'], number, beta, 2, 2, 2)
+              mh_label = 'MH10' if customers == 10 else 'MH15_20'
+              milp_reference = references['MILP'].get(key)
+              mh_reference = references[mh_label].get(key)
+              result.update(paper_milp_source=reference_files['MILP'],
+                            paper_matheuristic_source=reference_files[mh_label])
+              if milp_reference:
+                  result.update(paper_milp_objective=float(milp_reference['Objective value']),
+                                paper_milp_gap=milp_reference.get('Gap'))
+              if mh_reference:
+                  result['paper_matheuristic_objective'] = float(mh_reference['Objective value'])
+              available = int(milp_reference is not None) + int(mh_reference is not None)
+              result['paper_match_status'] = ('matched' if available == 2 else
+                                              'matched_partial_reference' if available else 'reference_unavailable')
+              notes = []
+              for label, record in [('MILP', milp_reference), (mh_label, mh_reference)]:
+                  if record is None:
+                      notes.append(reference_errors.get(label, f'No paper row for {reference_files[label]} and the selected configuration.'))
+              result['paper_match_note'] = '; '.join(notes)
+              return result
+
+          def read_result(entry):
+              prefix = f"metrics-{entry['solver']}-{entry['instance_id']}-{run_id}-"
+              candidates = []
+              for folder in root.glob(prefix + '*'):
+                  suffix = folder.name[len(prefix):]
+                  if folder.is_dir() and suffix.isdigit() and first_attempt <= int(suffix) <= run_attempt:
+                      candidates.append((int(suffix), folder))
+              if not candidates:
+                  status = ('metrics_download_failed' if os.environ['METRICS_DOWNLOAD_OUTCOME'] != 'success'
+                            else 'missing_result')
+                  return {'status': status, 'errors': ['No result.json artifact was available.']}
+              attempt, folder = max(candidates)
+              try:
+                  data = json.loads((folder / 'result.json').read_text(encoding='utf-8'))
+                  if not isinstance(data, dict):
+                      raise ValueError('Expected a JSON object.')
+                  expected = {
+                      'instance': entry['instance'], 'solver': entry['solver'],
+                      'normalized_input_sha256': entry['normalized_sha256'],
+                      'depot': os.environ['DEPOT'], 'commit': os.environ['GITHUB_SHA'],
+                      'run_id': run_id, 'run_attempt': attempt, 'time_limit_seconds': 3600,
+                  }
+                  if any(data.get(key) != value for key, value in expected.items()):
+                      raise ValueError('Result metadata differs from the selected instance/run.')
+                  if entry['solver'] == 'Tabu' and data.get('tabu_seed') != os.environ['RUN_SEED']:
+                      raise ValueError('Tabu run number differs from this workflow.')
+                  if not isinstance(data.get('status'), str) or not isinstance(data.get('errors'), list):
+                      raise ValueError('Missing result status or errors.')
+                  if any(not isinstance(error, str) for error in data['errors']):
+                      raise ValueError('Invalid error messages.')
+                  objective = data.get('objective')
+                  if objective is not None and (type(objective) not in (int, float)
+                                                or not math.isfinite(objective) or objective < 0):
+                      raise ValueError('Objective must be a finite, nonnegative number or null.')
+                  return data
+              except (OSError, ValueError, TypeError) as error:
+                  return {'status': 'invalid_result', 'run_attempt': attempt, 'errors': [str(error)]}
+
+          def usable(data, solver):
+              return (data.get('objective') is not None and data.get('exit_code') == 0
+                      and not data.get('errors')
+                      and data.get('status') not in {'failed', 'invalid_result', 'missing_result',
+                                                    'not_completed_or_started', 'process_failed',
+                                                    'watchdog_timeout', 'infeasible', 'time_limit_no_incumbent',
+                                                    'no_feasible_solution', 'metrics_download_failed'}
+                      and (solver != 'Tabu' or data.get('status') == 'verified_feasible'))
+
+          selected = {}
+          for entry in entries:
+              selected.setdefault(entry['instance'], {})[entry['solver']] = entry
+          rows = []
+          for instance, pair in selected.items():
+              milp = read_result(pair['MILP'])
+              tabu = read_result(pair['Tabu'])
+              row = {
+                  'instance': instance, 'customers': milp.get('customers') or tabu.get('customers'),
+                  'depot': os.environ['DEPOT'], 'tabu_seed': os.environ['RUN_SEED'],
+                  'milp_objective': milp.get('objective'), 'tabu_objective': tabu.get('objective'),
+                  'tabu_minus_milp': None, 'tabu_vs_milp_pct': None, 'best_method': 'not_compared',
+                  'milp_status': milp['status'], 'tabu_status': tabu['status'],
+                  'milp_process_seconds': milp.get('process_seconds'),
+                  'tabu_process_seconds': tabu.get('process_seconds'),
+                  'milp_available_cpus': milp.get('available_cpus'),
+                  'tabu_available_cpus': tabu.get('available_cpus'),
+                  'milp_exit_code': milp.get('exit_code'), 'tabu_exit_code': tabu.get('exit_code'),
+                  'milp_errors': '; '.join(milp.get('errors', [])),
+                  'tabu_errors': '; '.join(tabu.get('errors', [])),
+                  'milp_run_attempt': milp.get('run_attempt'), 'tabu_run_attempt': tabu.get('run_attempt'),
+                  'time_limit_seconds': 3600, 'commit': os.environ['GITHUB_SHA'], 'run_id': run_id,
+                  'normalized_input_sha256': pair['MILP']['normalized_sha256'],
+              }
+              row.update(paper_result(pair['MILP']))
+              for solver, data in [('milp', milp), ('tabu', tabu)]:
+                  if usable(data, 'MILP' if solver == 'milp' else 'Tabu'):
+                      for baseline in ('milp', 'matheuristic'):
+                          reference = row[f'paper_{baseline}_objective']
+                          if reference is not None and reference > 0:
+                              relative_difference = (data['objective'] - reference) / reference * 100
+                              if math.isfinite(relative_difference):
+                                  row[f'{solver}_vs_paper_{baseline}_pct'] = round(relative_difference, 6)
+              if usable(milp, 'MILP') and usable(tabu, 'Tabu'):
+                  difference = tabu['objective'] - milp['objective']
+                  row['tabu_minus_milp'] = round(difference, 6)
+                  if milp['objective'] > 0:
+                      percent = difference / milp['objective'] * 100
+                      if math.isfinite(percent):
+                          row['tabu_vs_milp_pct'] = round(percent, 6)
+                  row['best_method'] = ('tie' if math.isclose(milp['objective'], tabu['objective'],
+                                                           rel_tol=1e-9, abs_tol=1e-6)
+                                        else 'Tabu' if difference < 0 else 'MILP')
+              rows.append(row)
+
+          output = Path('comparison')
+          output.mkdir(exist_ok=True)
+          # BOM and the standard CSV dialect let Excel read UTF-8 paths correctly.
+          with (output / 'milp_vs_tabu.csv').open('w', encoding='utf-8-sig', newline='') as stream:
+              writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+              writer.writeheader()
+              writer.writerows(rows)
+          notes = (
+              'MILP versus Tabu: one row per selected instance; lower objective is better.\n'
+              'tabu_minus_milp = Tabu objective - MILP objective.\n'
+              'tabu_vs_milp_pct = 100 * (Tabu - MILP) / MILP; blank when MILP is zero.\n'
+              'Positive percent: Tabu is worse; negative percent: Tabu is better.\n'
+              'This compares the returned solutions, not a proven gap to the global optimum.\n'
+              'Comparison fields are blank/not_compared unless both results are usable.\n'
+              'Missing objectives stay blank, never zero. Inspect statuses and errors.\n'
+              'process_seconds excludes dependency setup and MILP model export.\n'
+              'Each solver keeps its 3600-second budget and existing CPU settings.\n'
+              'Reruns use the newest available result per solver since the prepare attempt; '
+              'the two run_attempt columns identify the attempts actually used.\n'
+              'Paper sources: local Results/Truck-and-Drone (Limited Drone Fleet) CSVs.\n'
+              'Difference with paper (%) = 100 * (solver objective - paper objective) / paper objective.\n'
+              'Negative difference is better; positive is worse; zero is equal.\n'
+              'The four vs_paper percentage columns compare MILP/Tabu independently against paper MILP/matheuristic.\n'
+              'Paper matching requires the same n, beta, Num, depot, 2 trucks, 2 drones and drone capacity 2, '
+              'plus original customer coordinates/releases and delivery-only labels.\n'
+              'PD variants, modified all_d data and instances absent from the published tables keep paper fields blank; '
+              'see paper_match_status and paper_match_note. Missing/invalid reference files are also reported there.\n'
+              'Paper MILP values may be incumbents rather than optima; paper_milp_gap records the published gap.\n'
+          )
+          (output / 'README.txt').write_text(notes, encoding='utf-8')
+          compared = sum(row['best_method'] != 'not_compared' for row in rows)
+          paper_matched = sum(row['paper_match_status'] == 'matched' for row in rows)
+          lines = ['## MILP versus Tabu comparison', '',
+                   f'{len(rows)} instances; {compared} pairs with comparable results.', '',
+                   f'{paper_matched} inputs matched both published paper result tables.', '',
+                   'Download milp_vs_tabu.csv from the comparison-csv artifact.', '',
+                   '| Instance | MILP objective | Tabu objective | Tabu vs MILP (%) | Best method | MILP status | Tabu status |',
+                   '|---|---|---|---|---|---|---|']
+          for row in rows:
+              values = [row[key] for key in ('instance', 'milp_objective', 'tabu_objective',
+                                             'tabu_vs_milp_pct', 'best_method', 'milp_status', 'tabu_status')]
+              lines.append('| ' + ' | '.join('-' if value is None else str(value).replace('|', '/')
+                                            for value in values) + ' |')
+          lines.extend(['', 'Percent is relative to the MILP incumbent, which may not be optimal.',
+                        'See README.txt for column definitions and missing-result handling.'])
+          lines.extend(['', '### Comparison with the paper', '',
+                        '| Instance | Paper MILP | Paper matheuristic | MILP vs paper matheuristic (%) | Tabu vs paper matheuristic (%) | Paper match |',
+                        '|---|---|---|---|---|---|'])
+          for row in rows:
+              keys = ('instance', 'paper_milp_objective', 'paper_matheuristic_objective',
+                      'milp_vs_paper_matheuristic_pct', 'tabu_vs_paper_matheuristic_pct',
+                      'paper_match_status')
+              lines.append('| ' + ' | '.join('-' if row[key] is None else str(row[key]).replace('|', '/')
+                                            for key in keys) + ' |')
+          lines.extend(['', 'Difference (%) = 100 * (solver - paper) / paper. Negative is better.',
+                        'Input mismatches and missing references leave paper percentage differences blank.'])
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write('\n'.join(lines) + '\n')
+          print(f'Exported {len(rows)} instances ({compared} comparable pairs) to {output / "milp_vs_tabu.csv"}')
+          PY
+
+      - name: Upload the comparison CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparison-csv-${{ github.run_id }}-${{ github.run_attempt }}
+          path: comparison/
+          if-no-files-found: error
           retention-days: 14
