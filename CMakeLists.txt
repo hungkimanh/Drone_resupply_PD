@@ -34,6 +34,9 @@ endif()
 # Shared library sources (no main)
 set(PDP_SOURCES
     src/pdp_fitness.cpp
+    src/pdp_schedule.cpp
+    src/pdp_search.cpp
+    src/pdp_memetic.cpp
     src/pdp_ga.cpp
     src/pdp_init.cpp
     src/pdp_localsearch.cpp
@@ -79,16 +82,43 @@ if(BUILD_TESTING)
   add_executable(pdp_trip_boundary_test
       tests/pdp_trip_boundary_test.cpp
       src/pdp_fitness.cpp
+      src/pdp_schedule.cpp
   )
   target_include_directories(pdp_trip_boundary_test PRIVATE src)
   add_test(NAME pdp_trip_boundary_test COMMAND pdp_trip_boundary_test)
+  add_executable(pdp_paper_semantics_test tests/pdp_paper_semantics_test.cpp
+      src/pdp_fitness.cpp src/pdp_schedule.cpp src/pdp_lb.cpp)
+  target_include_directories(pdp_paper_semantics_test PRIVATE src)
+  add_test(NAME pdp_paper_semantics_test COMMAND pdp_paper_semantics_test)
+  add_executable(pdp_lsp_capacity_test tests/pdp_lsp_capacity_test.cpp
+      src/pdp_lsp.cpp src/pdp_fitness.cpp src/pdp_schedule.cpp)
+  target_include_directories(pdp_lsp_capacity_test PRIVATE src)
+  target_link_libraries(pdp_lsp_capacity_test PRIVATE ortools::ortools)
+  add_test(NAME pdp_lsp_capacity_test COMMAND pdp_lsp_capacity_test)
 endif()
 
 add_executable(pdp_decode_encoding
     src/decode_encoding_main.cpp
     src/pdp_fitness.cpp
+    src/pdp_schedule.cpp
     src/pdp_reader.cpp
     src/pdp_utils.cpp
     src/pdp_validation.cpp
 )
 target_include_directories(pdp_decode_encoding PRIVATE src)
+
+# Optional licensed CPLEX runner used by the local benchmark harness. Ordinary
+# heuristic/CI builds do not require CPLEX headers or libraries.
+set(CPLEX_STUDIO_ROOT "" CACHE PATH "Root of a licensed CPLEX Studio installation")
+if(CPLEX_STUDIO_ROOT)
+  find_path(CPLEX_INCLUDE_DIR ilcplex/cplex.h
+      HINTS "${CPLEX_STUDIO_ROOT}/cplex/include")
+  find_library(CPLEX_LIBRARY cplex
+      HINTS "${CPLEX_STUDIO_ROOT}/cplex/lib/x86-64_linux/static_pic")
+  if(NOT CPLEX_INCLUDE_DIR OR NOT CPLEX_LIBRARY)
+    message(FATAL_ERROR "CPLEX_STUDIO_ROOT must contain cplex/include and the Linux static_pic library")
+  endif()
+  add_executable(cplex_benchmark_driver src/cplex_benchmark_driver.cpp)
+  target_include_directories(cplex_benchmark_driver PRIVATE "${CPLEX_INCLUDE_DIR}")
+  target_link_libraries(cplex_benchmark_driver PRIVATE "${CPLEX_LIBRARY}" pthread dl m)
+endif()

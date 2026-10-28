@@ -3,12 +3,12 @@
 # a private HTTPS .tar.gz of a licensed Linux x86-64 CPLEX Studio installation.
 # Archive layout: CPLEX_Studio2211/cplex/bin/x86-64_linux/cplex (and its libraries).
 # Do not upload the proprietary archive as an Actions artifact or commit it.
-# Tabu's CP-SAT workers are hard-coded to 4 in src/pdp_lsp.cpp; YAML cannot
-# increase this. Its routing search is sequential. Build uses all visible CPUs.
+# Tabu routing is sequential; --threads configures CP-SAT workers from the
+# runner CPU count. Build uses all visible CPUs.
 # A licensed CPLEX archive must be supplied separately; it cannot be inferred
 # from the local workstation or replaced by the pip Community Edition.
-# MILP export retains all default trips/constraints. No warm start, model
-# reduction, search tuning, source replacement or additional solve is applied.
+# MILP export uses the default formulation selected by the current MILP.py.
+# The workflow applies no MIP start or source patch before solving it.
 # Original instances may start with a # comment, a customer, or depot ID 0.
 # Prepare validates every data row and publishes customer-only copies with a
 # generated # header. Both readers add the depot selected by the depot input;
@@ -402,13 +402,39 @@ jobs:
           # Grace allows an in-flight LSP/ALNS call and final validation to finish.
           timeout --signal=TERM --kill-after=30s 3780s \
             stdbuf -oL -eL ./pdp_solver "$INSTANCE_PATH" --depot "$depot_mode" \
-              --run "$RUN_SEED" --time "$TIME_LIMIT" \
+              --run "$RUN_SEED" --time "$TIME_LIMIT" --threads "$CPU_COUNT" \
               --encoding-output results/tabu_encoding.txt 2>&1 | tee results/tabu.log
           codes=("${PIPESTATUS[@]}")
           set -e
           echo "${codes[0]}" > results/exit_code.txt
           echo "$(( $(date +%s) - started ))" > results/process_seconds.txt
           if [[ ${codes[0]} -ne 0 || ${codes[1]} -ne 0 ]]; then exit 1; fi
+
+      - name: Independently replay the returned solution and export timing arithmetic
+        if: always()
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from MILP import read_instance
+          from scripts.benchmark_audit import read_milp_solution, read_encoding, export_audit
+          results = Path('results')
+          solver = os.environ['SOLVER']
+          solution = results / ('milp_solution.sol' if solver == 'MILP' else 'tabu_encoding.txt')
+          if not solution.exists():
+              print('No returned solution to replay; inspect solver/setup logs.')
+              raise SystemExit(0)
+          inst = read_instance(Path(os.environ['INSTANCE_PATH']), os.environ['DEPOT'])
+          if solver == 'MILP':
+              routes, header, _ = read_milp_solution(solution, inst)
+              reported = header['objectiveValue']
+          else:
+              routes, reported = read_encoding(solution)
+          audit = export_audit(results / 'audit', routes, inst, reported)
+          print((results / 'audit' / 'objective_calculation.md').read_text())
+          if not audit['raw_replay']['valid'] or not audit['earliest_fixed_decisions']['valid']:
+              raise SystemExit('Independent physical replay failed; inspect results/audit/audit.json.')
+          PY
 
       - name: Validate solver outcome and publish summary
         if: always()
@@ -494,6 +520,22 @@ jobs:
                   metrics['status'] = 'no_feasible_solution'
               else:
                   errors.append('Tabu has no verified final result.')
+          audit_file = results / 'audit' / 'audit.json'
+          if metrics['objective'] is not None:
+              if not audit_file.exists():
+                  errors.append('No independent physical audit was produced.')
+              else:
+                  try:
+                      audit = json.loads(audit_file.read_text())
+                      raw = audit['raw_replay']
+                      verified = audit['earliest_fixed_decisions']
+                      if not raw['valid'] or not verified['valid']:
+                          raise ValueError('Physical schedule is invalid.')
+                      metrics['solver_reported_objective'] = metrics['objective']
+                      metrics['objective'] = float(verified['objective'])
+                      metrics['physical_audit_valid'] = True
+                  except (KeyError, TypeError, ValueError) as exc:
+                      errors.append(f'Invalid independent physical audit: {exc}')
           metrics['errors'] = errors
           if errors:
               metrics['status'] = 'failed'
@@ -509,9 +551,9 @@ jobs:
           else:
               lines.extend(['', 'No solver log; inspect setup/build steps for errors.'])
           lines.extend(['', 'Full logs, input, model/solution and Tabu encoding are in the job artifact.',
-                        'Tabu routing is sequential; CP-SAT uses the source constant of 4 workers.',
+                        'Tabu routing is sequential; CP-SAT receives the runner CPU count through --threads.',
                         'The 3600-second solver limits exclude dependency setup and MILP model export.',
-                        'Tabu may finish an in-flight evaluation after its time budget.'])
+                        'Audit timelines and explicit objective arithmetic are included under results/audit/.'])
           summary = '\n'.join(lines) + '\n'
           Path('results/summary.md').write_text(summary)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
@@ -741,7 +783,7 @@ jobs:
               except (OSError, ValueError, IndexError) as error:
                   result.update(paper_match_status='input_not_verified', paper_match_note=str(error))
                   return result
-              # Both unmodified solvers use two trucks, two drones and capacity 2
+              # Both solvers use two trucks, two drones and capacity 2
               # for 10-20 customers. Never mix with Truck-Only or Unlimited Fleet.
               key = (customers, os.environ['DEPOT'], number, beta, 2, 2, 2)
               mh_label = 'MH10' if customers == 10 else 'MH15_20'
@@ -757,7 +799,7 @@ jobs:
               available = int(milp_reference is not None) + int(mh_reference is not None)
               result['paper_match_status'] = ('matched' if available == 2 else
                                               'matched_partial_reference' if available else 'reference_unavailable')
-              notes = []
+              notes = ['Input/fleet matching only: equivalence to the published numerical conventions is unresolved; a negative difference is not proof of improving a published optimum.']
               for label, record in [('MILP', milp_reference), (mh_label, mh_reference)]:
                   if record is None:
                       notes.append(reference_errors.get(label, f'No paper row for {reference_files[label]} and the selected configuration.'))
@@ -822,6 +864,8 @@ jobs:
                   'instance': instance, 'customers': milp.get('customers') or tabu.get('customers'),
                   'depot': os.environ['DEPOT'], 'tabu_seed': os.environ['RUN_SEED'],
                   'milp_objective': milp.get('objective'), 'tabu_objective': tabu.get('objective'),
+                  'milp_solver_reported_objective': milp.get('solver_reported_objective'),
+                  'tabu_solver_reported_objective': tabu.get('solver_reported_objective'),
                   'tabu_minus_milp': None, 'tabu_vs_milp_pct': None, 'best_method': 'not_compared',
                   'milp_status': milp['status'], 'tabu_status': tabu['status'],
                   'milp_process_seconds': milp.get('process_seconds'),
@@ -876,6 +920,7 @@ jobs:
               'Reruns use the newest available result per solver since the prepare attempt; '
               'the two run_attempt columns identify the attempts actually used.\n'
               'Paper sources: local Results/Truck-and-Drone (Limited Drone Fleet) CSVs.\n'
+              'Paper percentages are descriptive; input matching does not establish equivalence to the published numerical conventions.\n'
               'Difference with paper (%) = 100 * (solver objective - paper objective) / paper objective.\n'
               'Negative difference is better; positive is worse; zero is equal.\n'
               'The four vs_paper percentage columns compare MILP/Tabu independently against paper MILP/matheuristic.\n'

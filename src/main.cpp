@@ -8,7 +8,7 @@
  *
  * Usage: ./pdp_solver <instance_file> [options]
  *   --depot 0|1|2   depot mode (1=border default for bundled instances)
- *   --iter N        TS max iterations (default 1000)
+ *   --iter N        optional TS iteration cap (default INT_MAX; time limit binds)
  *   --lsp T         CP-SAT time limit per call in seconds (default 3.0)
  *   --run K         run number / random seed
  *   --time T        total time limit in seconds
@@ -18,6 +18,10 @@
  */
 
 #include <chrono>
+#include <cmath>
+#include <thread>
+#include <filesystem>
+#include "pdp_memetic.h"
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
@@ -107,7 +111,7 @@ static SolutionEncoding diverseU10Fixture() {
 }
 
 int main(int argc, char* argv[]) {
-    auto t_start = chrono::high_resolution_clock::now();
+    auto t_start = chrono::steady_clock::now();
 
     if (argc < 2) {
         cerr << "Usage: " << argv[0] << " <instance_file> [--depot 0|1|2]"
@@ -117,7 +121,7 @@ int main(int argc, char* argv[]) {
 
     const string instanceFile = argv[1];
     int depotMode    = 1;
-    int maxIter      = 1000;
+    int maxIter      = std::numeric_limits<int>::max();
     double lspCutoff = 3.0;
     int runNumber    = 1;
     double timeLimit = -1.0;
@@ -125,6 +129,10 @@ int main(int argc, char* argv[]) {
     int numDronesOverride = -1;
     string encodingOutput;
     bool checkDiverse = false;
+    int droneCapacityOverride = 0;
+    int workers = std::max(1, int(std::thread::hardware_concurrency()));
+    double certificateBound = -1;
+    string algorithm = "adaptive", historyOutput;
 
     for (int i = 2; i < argc; ++i) {
         string arg = argv[i];
@@ -134,7 +142,9 @@ int main(int argc, char* argv[]) {
         }
         if ((arg == "--depot" || arg == "--iter" || arg == "--lsp" ||
              arg == "--run"   || arg == "--time" || arg == "--truck-cap" ||
-             arg == "--drones" || arg == "--encoding-output") && i + 1 < argc) {
+             arg == "--drones" || arg == "--encoding-output" || arg == "--algorithm" ||
+             arg == "--history-output" || arg == "--threads" || arg == "--drone-cap" ||
+             arg == "--certificate-bound") && i + 1 < argc) {
             istringstream ss(argv[++i]);
             if      (arg == "--depot") ss >> depotMode;
             else if (arg == "--iter")  ss >> maxIter;
@@ -144,12 +154,21 @@ int main(int argc, char* argv[]) {
             else if (arg == "--truck-cap") ss >> truckCapacityOverride;
             else if (arg == "--drones") ss >> numDronesOverride;
             else if (arg == "--encoding-output") encodingOutput = argv[i];
+            else if (arg == "--history-output") historyOutput = argv[i];
+            else if (arg == "--algorithm") algorithm = argv[i];
+            else if (arg == "--threads") ss >> workers;
+            else if (arg == "--drone-cap") ss >> droneCapacityOverride;
+            else if (arg == "--certificate-bound") ss >> certificateBound;
         } else {
             cerr << "Unknown argument: " << arg << "\n";
             return 1;
         }
     }
 
+    if (algorithm != "corrected" && algorithm != "adaptive" && algorithm != "memetic" && algorithm != "full") {
+        cerr << "--algorithm must be corrected, adaptive, memetic or full\n"; return 1;
+    }
+    if (workers < 1 || droneCapacityOverride < 0) { cerr << "Invalid resource setting\n"; return 1; }
     if (depotMode < 0 || depotMode > 2) {
         cerr << "Invalid --depot value: " << depotMode << " (expected 0, 1, or 2)\n";
         return 1;
@@ -163,7 +182,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (truckCapacityOverride > 0) data.truckCapacity = truckCapacityOverride;
+    // Match MILP.py's automatic choice: unrestricted C1 carry is the
+    // delivery-only/nonbinding-capacity benchmark policy. The extended
+    // positional PDP policy requires C1 delivery before the next depot visit.
+    data.allowC1CarryAcrossDepot = data.truckCapacity >= data.numCustomers &&
+        all_of(data.nodeTypes.begin()+1,data.nodeTypes.end(),[](const string& type) { return type=="D"; });
     if (numDronesOverride >= 0) data.numDrones = numDronesOverride;
+    data.droneCapacity = droneCapacityOverride;
+    data.lspWorkers = workers;
     showPDPInfo(data);
 
     if (checkDiverse) {
@@ -181,7 +207,7 @@ int main(int argc, char* argv[]) {
         return valid ? 0 : 2;
     }
 
-    bool isSmall = (data.numCustomers + 1 <= 20);
+    bool isSmall = (data.numCustomers <= 20);
     if (timeLimit < 0) timeLimit = isSmall ? 150.0 : 3600.0;
 
     const string depotNames[] = {"center", "border", "outside"};
@@ -214,8 +240,10 @@ int main(int argc, char* argv[]) {
     }
     if (best_init_enc.empty()) {
         // Fallback: take first individual
-        best_init_enc = population[0];
-        best_init_cost = decode_solution(best_init_enc, data, false).totalCost;
+        best_init_enc = greedyLoading(data, extractVRPSolution(population[0]));
+        auto fallback = decode_solution(best_init_enc, data, false);
+        if (!fallback.isFeasible) { cerr << "No feasible initial solution\n"; return 2; }
+        best_init_cost = fallback.totalCost;
     }
 
     VRPSolution init_vrp = extractVRPSolution(best_init_enc);
@@ -235,17 +263,63 @@ int main(int argc, char* argv[]) {
     if (data.numCustomers >= 18 && cfg.lsp_cutoff < 5.0)
         cfg.lsp_cutoff = 5.0;
 
-    // FIX 3: Time-based termination — use remaining budget after GA init [paper §5.2]
-    {
-        auto now = chrono::high_resolution_clock::now();
-        double used = chrono::duration<double>(now - t_start).count();
-        cfg.time_limit_sec = max(10.0, timeLimit - used - 2.0);
+    SearchOptions options;
+    options.cache = options.warm = options.adaptive = algorithm != "corrected";
+    options.critical = algorithm == "full";
+    options.lsp_seconds = cfg.lsp_cutoff;
+    options.certificate_bound = certificateBound;
+    SearchContext context(data, options, t_start, timeLimit);
+    if (std::isfinite(best_init_cost)) {
+        LSPResult initial;
+        initial.feasible = true; initial.objective = best_init_cost;
+        initial.encoding = best_init_enc; initial.status = "INITIAL_VERIFIED";
+        context.consider(initial);
     }
-    // When time limit governs, use a large iteration cap (not the --iter default of 1000)
-    cfg.max_iter = (cfg.time_limit_sec > 0) ? 10000000 : maxIter;
-
-    cout << "[L1] Starting Tabu Search...\n";
-    TSResult ts = tabuSearch(data, init_vrp, cfg);
+    cfg.context = &context;
+    cfg.time_limit_sec = context.remaining();
+    cfg.max_iter = maxIter;
+    TSResult ts;
+    ts.iterations_done = 0;
+    if (algorithm == "memetic" || algorithm == "full") {
+        cout << "[SEARCH] Memetic GA + shared Tabu/LSP evaluator\n";
+        memeticSearch(data, population, context, cfg, runNumber * 137);
+    } else {
+        cout << "[SEARCH] Tabu/LSP algorithm=" << algorithm << "\n";
+        ts = tabuSearch(data, init_vrp, cfg);
+    }
+    ts.best_lsp = context.best;
+    ts.best_obj = context.best.objective;
+    if (!historyOutput.empty() && context.checkpoint_best.feasible) {
+        auto checkpoint_path = std::filesystem::path(historyOutput).parent_path() / "checkpoint_150_encoding.txt";
+        writeEncodingFile(checkpoint_path.string(), decode_solution(context.checkpoint_best.encoding, data, false));
+    }
+    if (!historyOutput.empty()) {
+        ofstream out(historyOutput);
+        out << std::setprecision(12);
+        double checkpoint = std::numeric_limits<double>::infinity();
+        for (const auto& h : context.history) if (h.first <= 150.0) checkpoint = h.second;
+        out << "{\"algorithm\":\"" << algorithm << "\",\"time_limit_seconds\":" << timeLimit
+            << ",\"elapsed_seconds\":" << context.elapsed()
+            << ",\"checkpoint_seconds\":150,\"checkpoint_objective\":";
+        if (std::isfinite(checkpoint)) out << checkpoint; else out << "null";
+        out << ",\"objective\":";
+        if (std::isfinite(ts.best_obj)) out << ts.best_obj; else out << "null";
+        out << ",\"evaluations\":" << context.evaluations << ",\"cp_calls\":" << context.cp_calls
+            << ",\"cache_hits\":" << context.cache_hits << ",\"fallbacks\":" << context.fallbacks
+            << ",\"warm_reuses\":" << context.warm_reuses
+            << ",\"adaptive_refinements\":" << context.adaptive_refinements
+            << ",\"waiting_escapes\":" << context.waiting_escapes
+            << ",\"threads\":" << workers << ",\"drone_capacity\":" << data.getDroneCapacity()
+            << ",\"certificate_bound\":" << certificateBound
+            << ",\"certified_stop\":" << (certificateBound >= 0 && ts.best_obj <= certificateBound + 1e-6 ? "true" : "false")
+            << ",\"history\":[";
+        bool first = true;
+        for (const auto& h : context.history) {
+            if (!first) out << ','; first = false;
+            out << '[' << h.first << ',' << h.second << ']';
+        }
+        out << "]}\n";
+    }
 
     // ============================================================
     // Results
@@ -267,7 +341,7 @@ int main(int argc, char* argv[]) {
         if (!valid) {
             cout << "No verified feasible solution found.\n";
             double elapsed = chrono::duration<double>(
-                chrono::high_resolution_clock::now() - t_start).count();
+                chrono::steady_clock::now() - t_start).count();
             cout << "\n[RUNTIME] " << fixed << setprecision(2) << elapsed << " s\n";
             return 2;
         }
@@ -285,7 +359,7 @@ int main(int argc, char* argv[]) {
     }
 
     double elapsed = chrono::duration<double>(
-        chrono::high_resolution_clock::now() - t_start).count();
+        chrono::steady_clock::now() - t_start).count();
     cout << "\n[RUNTIME] " << fixed << setprecision(2) << elapsed << " s\n";
 
     return 0;

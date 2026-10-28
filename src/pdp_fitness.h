@@ -2,6 +2,10 @@
 #define PDP_FITNESS_H
 
 #include "pdp_types.h"
+
+// Earliest continuous schedule for fixed truck routes, loading decisions and
+// per-drone sortie order. Returns false for a positive precedence cycle.
+bool retimeFixedDroneSchedule(SolutionEncoding& encoded, const PDPData& data);
 #include <vector>
 #include <string>
 

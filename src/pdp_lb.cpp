@@ -18,8 +18,13 @@ double computeNodeLB(const PDPData& data, int customer) {
     double r_i        = static_cast<double>(data.readyTimes[customer]);
     double s_i        = data.truckServiceTime;
     double t_0i       = truckTravelTime(data, 0, customer);
-    double drone_reach = data.depotDroneLoadTime
+    double drone_reach = data.resupplyTime
                        + droneTravelTime(data, 0, customer);
+
+    // P/DL requests originate at a customer, not at the depot. Do not apply
+    // the delivery-only release/depot bound to those nodes.
+    if (data.nodeTypes[customer] == "P" || data.nodeTypes[customer] == "DL")
+        return s_i;
 
     return r_i + std::min(drone_reach, t_0i) + s_i;
 }

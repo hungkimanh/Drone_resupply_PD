@@ -19,6 +19,8 @@
 #include <iomanip>
 #include <map>
 #include <cmath>
+#include <algorithm>
+#include <stdexcept>
 
 using namespace std;
 
@@ -41,7 +43,7 @@ void buildAllDistanceMatrices(PDPData& data) {
             const auto& c1 = data.coordinates[i];
             const auto& c2 = data.coordinates[j];
 
-            // Drone: Euclidean → exact minutes (no rounding — paper uses exact distances)
+            // Drone: Euclidean minutes from the input coordinates, without rounding.
             double eu   = euclideanDistance(c1.first, c1.second, c2.first, c2.second);
             double tDrn = (eu / data.droneSpeed) * 60.0;
             data.droneDistMatrix[i][j] = data.droneDistMatrix[j][i] = tDrn;
@@ -76,31 +78,52 @@ bool readPDPFile(const string& filename, PDPData& data) {
 
     // ---- Raw parse: read all customer rows into temp buffers ----
     string line;
-    getline(file, line);  // skip header line
 
     vector<pair<double,double>> tempCoords;
     vector<string>              tempTypes;
     vector<int>                 tempReadyTimes;
     vector<int>                 tempPairIds;
 
+    int line_number = 0;
     while (getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-
-        istringstream iss(line);
-        int    id, readyTime, pairId;
-        double x, y;
-        string type;
-
-        // Format: <id> <x> <y> <type> <readyTime> <pairId>
-        if (iss >> id >> x >> y >> type >> readyTime >> pairId) {
-            tempCoords.push_back({x, y});
-            tempTypes.push_back(type);
-            tempReadyTimes.push_back(readyTime);
-            tempPairIds.push_back(pairId);
-            // Note: the `id` field from the file is the 1-based customer ID in the
-            // raw file, but we do NOT use it for indexing — we use tempCoords order.
+        ++line_number;
+        if (line_number == 1 && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+        const auto first = line.find_first_not_of(" \t\r");
+        if (first == string::npos || line[first] == '#') continue;
+        istringstream fields(line);
+        vector<string> tokens;
+        string token;
+        while (fields >> token) tokens.push_back(token);
+        if (tokens[0] == "ri" || tokens[0] == "id") continue;
+        try {
+            int id, readyTime, pairId = 0;
+            double x, y;
+            string type = "D";
+            if (tokens.size() == 3) {
+                id = static_cast<int>(tempCoords.size()) + 1;
+                readyTime = stoi(tokens[0]); x = stod(tokens[1]); y = stod(tokens[2]);
+            } else if (tokens.size() == 6) {
+                id = stoi(tokens[0]); x = stod(tokens[1]); y = stod(tokens[2]);
+                type = tokens[3]; readyTime = stoi(tokens[4]); pairId = stoi(tokens[5]);
+                if (id == 0) {
+                    if (!tempCoords.empty() || type != "D" || readyTime != 0 || pairId != 0)
+                        throw runtime_error("invalid depot row");
+                    continue;
+                }
+            } else throw runtime_error("expected 3 or 6 columns");
+            if (id != static_cast<int>(tempCoords.size()) + 1 || readyTime < 0 ||
+                !isfinite(x) || !isfinite(y) || (type != "D" && type != "P" && type != "DL"))
+                throw runtime_error("invalid customer fields");
+            tempCoords.push_back({x, y}); tempTypes.push_back(type);
+            tempReadyTimes.push_back(readyTime); tempPairIds.push_back(pairId);
+        } catch (const exception& ex) {
+            cerr << "[READER] Invalid row " << line_number << ": " << ex.what() << "\n";
+            return false;
         }
     }
+    if (tempCoords.empty()) return false;
+    data.allowC1CarryAcrossDepot = int(tempTypes.size()) <= data.truckCapacity &&
+        all_of(tempTypes.begin(), tempTypes.end(), [](const string& t) { return t == "D"; });
     file.close();
 
     // ================================================================

@@ -16,7 +16,7 @@ int main(int argc, char* argv[]) {
     }
 
     PDPData data;
-    data.depotMode = argc == 4 ? std::stoi(argv[3]) : 1;
+    data.depotMode = argc >= 4 ? std::stoi(argv[3]) : 1;
     if (!readPDPFile(argv[1], data)) return 1;
 
     std::ifstream input(argv[2]);
@@ -33,7 +33,7 @@ int main(int argc, char* argv[]) {
         std::string tag;
         row >> tag;
         if (tag.empty() || tag[0] == '#') continue;
-        if (tag == "MILP_CMAX") continue;
+        if (tag == "MILP_CMAX" || tag == "HEURISTIC_CMAX") continue;
         if (tag == "ROUTE") {
             encoding.emplace_back();
             current = &encoding.back();

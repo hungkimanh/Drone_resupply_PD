@@ -3,6 +3,7 @@
 
 #include "pdp_types.h"
 #include "pdp_lsp.h"
+#include "pdp_search.h"
 #include <random>
 #include <vector>
 
@@ -25,6 +26,8 @@ struct TSConfig {
     int seed              = 42;
     bool verbose          = true;
     bool randomize_tenure = true;   // randomize tabu tenure each iter [Taillard 1993]
+    SearchContext* context = nullptr;
+    bool pair_moves = true;
 };
 
 struct TSResult {
@@ -33,6 +36,9 @@ struct TSResult {
     double      best_obj;
     int         iterations_done;
 };
+
+VRPSolution waitingDrivenEscape(const PDPData& data, const VRPSolution& routes,
+                                 const LSPResult& solution, int count, std::mt19937& rng);
 
 // Run TS-ALNS-LSP solver
 // Layer 0 (init) must be done before calling this; pass the starting VRPSolution.

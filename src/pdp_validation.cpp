@@ -109,7 +109,8 @@ bool validateSolution(const PDPSolution& solution, const PDPData& data, bool ver
 
     // [2b] Every depot-to-depot truck trip must finish all C1 packages
     // loaded at its starting depot or received from a drone during that trip.
-    bool c1TripsOK = validateC1TripBoundaries(solution.encoded_routes, data, verbose);
+    bool c1TripsOK = data.allowC1CarryAcrossDepot ||
+        validateC1TripBoundaries(solution.encoded_routes, data, verbose);
     if (verbose) {
         cout << "\n[2b] C1 TRIP BOUNDARIES: " << (c1TripsOK ? "OK" : "FAILED") << "\n";
     }
@@ -153,7 +154,7 @@ bool validateSolution(const PDPSolution& solution, const PDPData& data, bool ver
         double expectedEnd = expectedStart + data.resupplyTime;
         double expectedReturn = expectedEnd + flyBack;
 
-        bool releaseOK = (ev.drone_depart_time + 1e-9 >= maxRelease + data.depotDroneLoadTime);
+        bool releaseOK = (ev.drone_depart_time + 1e-9 >= maxRelease);
         bool timingOK =
             idOK && nodeOK &&
             fabs(ev.drone_arrive_time - expectedArrive) <= 0.1 &&

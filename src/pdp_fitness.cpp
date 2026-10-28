@@ -97,7 +97,7 @@ static DroneTry tryAssignDroneTrip(const PDPData& data,
 
         const bool fixedTiming = fixed_stop != nullptr &&
             fixed_stop->fixed_drone_depart >= 0.0;
-        const double earliestDepart = max(droneAvail[d], maxRelease) + data.depotDroneLoadTime;
+        const double earliestDepart = max(droneAvail[d] + data.depotDroneLoadTime, maxRelease);
         const double latestNoWaitDepart = truck_sync_time - flyOut;
         ev.drone_depart_time = fixedTiming
             ? fixed_stop->fixed_drone_depart
@@ -127,7 +127,7 @@ static DroneTry tryAssignDroneTrip(const PDPData& data,
         const bool waitOK = (truck_wait <= data.allowedWait + 1e-9);
 
         const bool timingOK = !fixedTiming || (
-            ev.drone_depart_time + 1e-6 >= maxRelease + data.depotDroneLoadTime &&
+            ev.drone_depart_time + 1e-6 >= maxRelease &&
             fabs(ev.drone_arrive_time - ev.drone_depart_time - flyOut) <= 1e-5 &&
             ev.drone_return_time + 1e-6 >= ev.resupply_end_time + flyBack);
         const bool feasible = enduranceOK && waitOK && timingOK;
@@ -173,7 +173,8 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
     sol.drone_completion_times.assign(data.numDrones, 0.0);
     sol.drone_order.clear();
 
-    vector<double> droneAvail(data.numDrones, 0.0);
+    // Drones are prepared at time zero; turnaround applies between sorties.
+    vector<double> droneAvail(data.numDrones, -data.depotDroneLoadTime);
 
     auto addPenalty = [&](double p, const string& msg) {
         sol.totalPenalty += p;
@@ -239,7 +240,7 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
                 // A depot visit closes the current truck trip. C1 packages
                 // supplied at a depot or by a drone must be delivered before
                 // that boundary; C2 pickup loads may remain onboard.
-                if (idx > 0) {
+                if (idx > 0 && !data.allowC1CarryAcrossDepot) {
                     for (int p : onboard) {
                         if (p > 0 && p < (int)data.nodeTypes.size() &&
                             data.nodeTypes[p] != "P" && data.nodeTypes[p] != "DL") {
@@ -431,12 +432,12 @@ PDPSolution decode_solution(const SolutionEncoding& encoded, const PDPData& data
     }
 
     for (int d = 0; d < data.numDrones; ++d) {
-        sol.drone_completion_times[d] = droneAvail[d];
+        sol.drone_completion_times[d] = max(0.0, droneAvail[d]);
     }
 
     double makespan = 0.0;
     for (const auto& td : sol.truck_details) makespan = max(makespan, td.completion_time);
-    for (double dt : sol.drone_completion_times) makespan = max(makespan, dt);
+    // Benchmark objective: last truck return. Drone timing is checked separately.
     sol.totalCost = makespan;
 
     return sol;

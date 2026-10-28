@@ -6,6 +6,7 @@
 #include <utility>
 #include <stdexcept>
 #include <limits>
+#include <chrono>
 
 using namespace std;
 
@@ -24,9 +25,10 @@ using namespace std;
  *    The resupply is synchronized at i. If i can already be served by the
  *    truck, service happens first; if i needs a package in P, resupply happens
  *    first.
- *  - Every C1 package loaded at a depot or supplied by a drone must be
- *    delivered before the truck's next depot visit. C2 pickup loads may cross
- *    intermediate depot visits, provided pickup precedes delivery.
+ *  - In the positional PDP policy, every C1 package must be delivered before
+ *    the next depot visit. The delivery-only/nonbinding-capacity benchmark
+ *    policy permits C1 carry, controlled by allowC1CarryAcrossDepot. C2 pickup
+ *    loads may cross depot visits, provided pickup precedes delivery.
  */
 struct RouteStop {
     int node = 0;                 // 0 = depot, >0 = customer
@@ -61,10 +63,14 @@ struct LBInfo {
 
 // Result from the Loading Subproblem (Layer 2)
 struct LSPResult {
-    bool   solved    = false;  // false if cutoff triggered or infeasible
+    bool   solved    = false;  // CP-SAT returned a feasible grid-model solution
     bool   feasible  = false;
     double objective = std::numeric_limits<double>::infinity(); // C_max
     SolutionEncoding encoding; // full encoding if solved
+    std::string status = "NOT_RUN";
+    double model_objective = std::numeric_limits<double>::infinity();
+    double best_bound = -std::numeric_limits<double>::infinity(); // CP grid only, never a continuous/global certificate
+    bool used_fallback = false;
 };
 
 /**
@@ -129,12 +135,14 @@ struct PDPData {
     
     // === DRONE PARAMETERS ===
     int numDrones = 2;                      // Number of drones
-    int droneCapacity = 2;                  // Payload capacity per drone trip (weight/units)
+    int droneCapacity = 0;                  // 0: automatic (2 up to 20 customers, 10 above)
     double droneSpeed = 60.0;               // Drone cruising speed (km/h)
     double droneEndurance = 90.0;           // Maximum flight duration (minutes) for range constraint
     double resupplyTime = 5.0;              // Drone-to-truck handover time at rendezvous node (minutes)
     double depotDroneLoadTime = 5.0;        // Drone loading time at depot (minutes)
     double allowedWait = 999999.0;              // Max truck waiting time for drone at rendezvous (minutes)
+    bool allowC1CarryAcrossDepot = false;   // Original delivery-only benchmark permits this.
+    int lspWorkers = 2;
 
     // === DISTANCE MATRICES ===
     vector<vector<double>> truckDistMatrix; // Manhattan distance matrix (truck routing, urban/grid model)
@@ -167,7 +175,8 @@ struct PDPData {
     }
     
     int getDroneCapacity() const {
-        if (numCustomers + 1 <= 20) return 2;
+        if (droneCapacity > 0) return droneCapacity;
+        if (numCustomers <= 20) return 2;
         return 10;
     }
 };

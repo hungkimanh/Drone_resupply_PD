@@ -65,8 +65,8 @@ static bool isDirectDelivery(const PDPData& data, int j) {
 struct DroneScheduleInit {
     vector<double> droneAvail;  // droneAvail[d] = time when drone d returns to depot
 
-    explicit DroneScheduleInit(int numDrones)
-        : droneAvail(numDrones, 0.0) {}
+    explicit DroneScheduleInit(int numDrones, double turnaround)
+        : droneAvail(numDrones, -turnaround) {}
 
     /// Find the earliest-available drone
     int findBestDrone() const {
@@ -242,8 +242,7 @@ static DroneResupplyOption findDroneResupplySet(
         int droneId = schedule.findBestDrone();
         if (droneId < 0) break;
 
-        double droneDept = max(schedule.droneAvail[droneId], testMaxRel)
-                         + data.depotDroneLoadTime;
+        double droneDept = max(schedule.droneAvail[droneId] + data.depotDroneLoadTime, testMaxRel);
         double droneArr  = droneDept + flyOut;
 
         // Check truck wait constraint
@@ -269,8 +268,7 @@ static DroneResupplyOption findDroneResupplySet(
     int droneId = schedule.findBestDrone();
     if (droneId < 0) return result;
 
-    double droneDept = max(schedule.droneAvail[droneId], maxRelease)
-                     + data.depotDroneLoadTime;
+    double droneDept = max(schedule.droneAvail[droneId] + data.depotDroneLoadTime, maxRelease);
     double droneArr  = droneDept + flyOut;
     double resStart  = max(droneArr, truck_time);
     double resEnd    = resStart + data.resupplyTime;
@@ -582,7 +580,7 @@ static SolutionEncoding buildIndividual(const PDPData& data, mt19937& gen) {
     repairC2CustomerRoutes(customerRoutes, data);
 
     // Shared drone schedule: drones are shared across all trucks
-    DroneScheduleInit droneSchedule(max(1, data.numDrones));
+    DroneScheduleInit droneSchedule(data.numDrones, data.depotDroneLoadTime);
     for (int k = 0; k < nTrucks; ++k) {
         sol[k] = buildRouteWithResupply(customerRoutes[k], k, data, droneSchedule, gen);
     }

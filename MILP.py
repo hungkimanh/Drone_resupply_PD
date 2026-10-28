@@ -4,18 +4,19 @@ MILP model for the Truck-Drone Resupply PDP instances.
 
 Solver backend: IBM CPLEX through docplex.mp.
 
-This file builds a compact position-based MILP for small/medium instances:
+Delivery-only benchmarks with nonbinding truck capacity use the compact
+arc formulation in paper_milp.py. Pickup/delivery instances use trip positions:
   - truck routing over trip-position pairs,
   - multi-trip trucks with pickup load carried across depot returns,
   - pickup-delivery same-truck and global pickup-before-delivery constraints,
   - C1 delivery packages either loaded at the depot before a truck trip or supplied by drone,
   - drone trips with payload capacity, release dates, endurance and sequencing,
   - synchronization at the truck rendezvous position,
-  - objective: minimize C_max over truck and drone completion times.
+  - objective: minimize C_max over truck return times (the paper's objective).
 
 Notes:
-  - Instance format matches Instance/Instance/*.txt in this repository.
-  - Depot is not in the file; it is selected by --depot {center,border,outside}.
+  - Original 3-column and six-column instance formats are accepted.
+  - An optional depot row is ignored; --depot selects its physical coordinates.
   - This is intended as an exact MILP baseline for small instances such as n=10.
 """
 
@@ -24,6 +25,7 @@ import math
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -122,23 +124,27 @@ def read_instance(path: Path, depot: str) -> Instance:
     nodes = [Node(0, dx, dy, "DEPOT", 0.0, 0)]
 
     with path.open("r", encoding="utf-8-sig") as f:
-        header_seen = False
-        for raw in f:
+        for line_number, raw in enumerate(f, 1):
             line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("#"):
-                header_seen = True
+            if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) < 6:
+            if parts[0] in {"ri", "id"}:
                 continue
-            file_id = int(parts[0])
-            x = float(parts[1])
-            y = float(parts[2])
-            typ = parts[3]
-            release = float(parts[4])
-            pair_id = int(parts[5])
+            if len(parts) == 3:
+                release, x, y = map(float, parts)
+                file_id, typ, pair_id = len(nodes), "D", 0
+            elif len(parts) == 6:
+                file_id, x, y = int(parts[0]), float(parts[1]), float(parts[2])
+                typ, release, pair_id = parts[3], float(parts[4]), int(parts[5])
+                if file_id == 0:
+                    if len(nodes) != 1 or typ != "D" or release != 0 or pair_id != 0:
+                        raise ValueError(f"invalid depot row at {path}:{line_number}")
+                    continue
+            else:
+                raise ValueError(f"expected 3 or 6 columns at {path}:{line_number}")
+            if file_id != len(nodes) or typ not in {"D", "P", "DL"} or release < 0 or not all(map(math.isfinite, (x, y, release))):
+                raise ValueError(f"invalid customer at {path}:{line_number}")
             nodes.append(Node(file_id, x, y, typ, release, pair_id))
 
     if len(nodes) <= 1:
@@ -176,6 +182,9 @@ def build_milp(
     max_truck_trips: Optional[int] = None,
 ):
     Model = require_docplex()
+    if all(node.typ == "D" for node in inst.nodes[1:]) and inst.truck_capacity >= len(inst.nodes)-1 and max_truck_trips is None:
+        from paper_milp import build_paper_milp
+        return build_paper_milp(inst, Model, time_limit or 3600, log_output)
     mdl = Model(name="truck_drone_resupply_pdp")
     mdl.context.cplex_parameters.threads = 8
     if time_limit is not None and time_limit > 0:
@@ -358,6 +367,11 @@ def build_milp(
                 mdl.add_constraint(load_after[v, m, p] >= prev_load + delta - big_m * (1 - used[v, m, p]), ctname=f"load_lb_{v}_{m}_{p}")
                 mdl.add_constraint(load_after[v, m, p] <= prev_load + delta + big_m * (1 - used[v, m, p]), ctname=f"load_ub_{v}_{m}_{p}")
                 mdl.add_constraint(load_after[v, m, p] <= inst.truck_capacity * used[v, m, p], ctname=f"truck_cap_after_{v}_{m}_{p}")
+                # If the drone brings the parcel served at this very stop,
+                # handover precedes service: that parcel is still onboard at
+                # the peak load, before delivery removes it.
+                mdl.add_constraint(load_after[v, m, p] + mdl.sum(own_from_drone[v, m, p, i] for i in c1_nodes)
+                                   <= inst.truck_capacity * used[v, m, p], ctname=f"truck_cap_handover_{v}_{m}_{p}")
 
             mdl.add_constraint(load_end[v, m] <= inst.truck_capacity * trip_on[v, m], ctname=f"load_end_cap_{v}_{m}")
             for p in positions:
@@ -416,8 +430,7 @@ def build_milp(
                 mdl.add_constraint(trip_used[d, r] <= trip_used[d, r - 1], ctname=f"drone_no_gap_{d}_{r}")
                 mdl.add_indicator(trip_used[d, r], dr_dep[d, r] >= dr_ret[d, r - 1] + inst.drone_load, name=f"drone_seq_{d}_{r}")
             else:
-                mdl.add_indicator(trip_used[d, r], dr_dep[d, r] >= inst.drone_load, name=f"first_drone_load_{d}_{r}")
-            mdl.add_indicator(trip_used[d, r], cmax >= dr_ret[d, r], name=f"drone_cmax_{d}_{r}")
+                mdl.add_indicator(trip_used[d, r], dr_dep[d, r] >= 0, name=f"first_drone_load_{d}_{r}")
             mdl.add_indicator(trip_used[d, r], dr_ret[d, r] - dr_dep[d, r] <= inst.drone_endurance, name=f"endurance_{d}_{r}")
 
     for d in drones:
@@ -435,7 +448,7 @@ def build_milp(
                     for d in drones:
                         for r in trip_slots:
                             mdl.add_constraint(
-                                dr_dep[d, r] >= inst.nodes[i].release + inst.drone_load
+                                dr_dep[d, r] >= inst.nodes[i].release
                                 - big_m * (2 - b[v, m, p, i] - mdl.sum(w[d, r, v, m, p, h] for h in customers)),
                                 ctname=f"dr_release_{d}_{r}_{v}_{m}_{p}_{i}",
                             )
@@ -526,7 +539,12 @@ def _val(x) -> float:
     return 0.0 if x is None else float(x.solution_value)
 
 
-def print_solution(mdl, inst: Instance) -> None:
+def print_solution(mdl, inst: Instance, solution=None) -> None:
+    solution = solution if solution is not None else mdl.solution
+    _val = lambda var: 0.0 if var is None else float(solution.get_value(var))
+    if hasattr(mdl, "_paper_vars"):
+        from paper_milp import print_paper_solution
+        return print_paper_solution(mdl, inst, solution)
     data = mdl._pdp_vars
     y = data["y"]
     trip_on = data["trip_on"]
@@ -601,6 +619,7 @@ def find_cplex_exe(user_path: Optional[Path] = None) -> Optional[Path]:
     if user_path is not None:
         return user_path if user_path.exists() else None
     candidates = [
+        Path.home() / "CPLEX_Studio2211" / "cplex" / "bin" / "x86-64_linux" / "cplex",
         Path(r"C:\Program Files\IBM\ILOG\CPLEX_Studio221\cplex\bin\x64_win64\cplex.exe"),
         Path(r"C:\Program Files\IBM\ILOG\CPLEX_Studio2211\cplex\bin\x64_win64\cplex.exe"),
         Path(r"C:\Program Files\IBM\ILOG\CPLEX_Studio2212\cplex\bin\x64_win64\cplex.exe"),
@@ -619,6 +638,7 @@ def solve_with_cplex_exe(
     time_limit: Optional[float],
     mipgap: Optional[float],
     mipstart_path: Optional[Path] = None,
+    inst: Optional[Instance] = None,
 ) -> int:
     lp_path.parent.mkdir(parents=True, exist_ok=True)
     sol_path.parent.mkdir(parents=True, exist_ok=True)
@@ -649,7 +669,21 @@ def solve_with_cplex_exe(
     print(proc.stdout)
     if sol_path.exists():
         print(f"CPLEX solution file: {sol_path}")
+        if inst is not None:
+            audit_exported_solution(inst, sol_path)
     return proc.returncode
+
+
+def audit_exported_solution(inst: Instance, sol_path: Path) -> None:
+    """Print and save the arithmetic of a returned solution, without optimizing."""
+    from scripts.benchmark_audit import read_milp_solution, export_audit
+    routes, header, _ = read_milp_solution(sol_path, inst)
+    directory = sol_path.parent / (sol_path.stem + "_audit")
+    audit = export_audit(directory, routes, inst, header["objectiveValue"])
+    if not audit["raw_replay"]["valid"] or not audit["earliest_fixed_decisions"]["valid"]:
+        raise ValueError(f"Physical replay failed: {audit['raw_replay']['errors']}")
+    print((directory / "objective_calculation.md").read_text())
+    print(f"Detailed timeline CSVs and audit: {directory}")
 
 
 def write_mst(path: Path, values: Dict[str, float], problem_name: str, obj_value: Optional[float] = None) -> None:
@@ -785,7 +819,7 @@ def diverse_u10_start() -> Dict[str, float]:
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Build/solve MILP for Truck-Drone Resupply PDP with CPLEX.")
-    parser.add_argument("instance", type=Path, help="Path to *_pd.txt instance file")
+    parser.add_argument("instance", type=Path, help="Original 3-column benchmark or six-column PDP file")
     parser.add_argument("--depot", choices=sorted(DEPOTS), default="border", help="Depot position mode")
     parser.add_argument("--time", type=float, default=300.0, help="CPLEX time limit in seconds")
     parser.add_argument("--mipgap", type=float, default=None, help="Relative MIP gap, e.g. 0.01")
@@ -827,6 +861,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.no_solve:
         return 0
 
+    search_started = time.monotonic()
     try:
         sol = mdl.solve(log_output=not args.quiet)
     except Exception as exc:
@@ -838,7 +873,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         lp_path = args.export_lp or Path("results/milp_model.lp")
         print(f"Docplex solve failed: {exc}")
         print(f"Fallback: solving exported LP with {cplex_exe}")
-        return solve_with_cplex_exe(mdl, cplex_exe, lp_path, args.sol_file, args.time, args.mipgap, mipstart_path)
+        remaining = max(0.0, args.time - (time.monotonic() - search_started)) if args.time > 0 else None
+        if remaining is not None and remaining <= 0:
+            print("No solver budget remains for CLI fallback.")
+            return 2
+        return solve_with_cplex_exe(mdl, cplex_exe, lp_path, args.sol_file, remaining, args.mipgap, mipstart_path, inst)
 
     if sol is None:
         print("No feasible solution found by CPLEX within the limit.")
@@ -847,15 +886,27 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     search_status = mdl.solve_details.status
     search_bound = mdl.solve_details.best_bound
     raw_objective = sol.objective_value
-    if args.polish_time > 0:
-        polished = polish_fixed_incumbent(mdl, args.polish_time, log_output=not args.quiet)
+    remaining = max(0.0, args.time - (time.monotonic() - search_started)) if args.time > 0 else args.polish_time
+    polish_budget = min(args.polish_time, remaining)
+    # Docplex rounds sub-second model limits up to one second.
+    if polish_budget >= 1.0:
+        try:
+            polished = polish_fixed_incumbent(mdl, polish_budget, log_output=not args.quiet)
+        except Exception as exc:
+            print(f"Timing polishing failed; retaining the feasible incumbent: {exc}")
+            polished = None
         if polished is not None:
             sol = polished
             print(f"Raw incumbent C_max: {raw_objective:.9f}")
             print(f"Polished fixed-decision C_max: {sol.objective_value:.9f}")
     print(f"Search status: {search_status}")
     print(f"Search best bound: {search_bound}")
-    print_solution(mdl, inst)
+    print_solution(mdl, inst, sol)
+    args.sol_file.parent.mkdir(parents=True, exist_ok=True)
+    exported = Path(sol.export_as_sol(path=str(args.sol_file.parent), basename=args.sol_file.name))
+    if exported != args.sol_file:
+        exported.replace(args.sol_file)
+    audit_exported_solution(inst, args.sol_file)
     return 0
 
 
